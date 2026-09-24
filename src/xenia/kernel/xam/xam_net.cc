@@ -7,6 +7,7 @@
  ******************************************************************************
  */
 
+#include <map>
 #include <random>
 
 // clang-format off
@@ -877,6 +878,21 @@ dword_result_t NetDll_XNetInAddrToString_entry(dword_t caller, dword_t ina,
 }
 DECLARE_XAM_EXPORT1(NetDll_XNetInAddrToString, kNetworking, kImplemented);
 
+// System link peers the title resolved through XNetXnAddrToInAddr, i.e. a
+// host XNADDR taken from the title's own LAN server browser. The reverse
+// lookup (XNetInAddrToXnAddr) answers from here with the peer's real XNADDR
+// and MAC instead of asking the Xenia server -- which a real 360 host is not
+// registered with, and which may not exist at all (360 crossplay bridge).
+// Keyed on the raw bytes of XNADDR.ina, the in_addr handed to the title.
+namespace {
+struct LanPeer {
+  XNADDR xnaddr;
+  uint64_t session_id;
+};
+std::mutex lan_peers_mutex;
+std::map<uint32_t, LanPeer> lan_peers;
+}  // namespace
+
 // This converts a XNet address to an in_addr. The in_addr is used for
 // subsequent socket calls (like a handle to a XNet address)
 dword_result_t NetDll_XNetXnAddrToInAddr_entry(dword_t caller,
@@ -904,6 +920,12 @@ dword_result_t NetDll_XNetXnAddrToInAddr_entry(dword_t caller,
 
   if (cvars::network_mode == NETWORK_MODE::LAN) {
     in_addr->s_addr = xn_addr->ina.s_addr;
+
+    LanPeer peer = {};
+    std::memcpy(&peer.xnaddr, xn_addr, sizeof(XNADDR));
+    peer.session_id = xid ? xid->as_uintBE64() : 0;
+    std::lock_guard<std::mutex> lock(lan_peers_mutex);
+    lan_peers[xn_addr->ina.s_addr] = peer;
   }
 
   if (cvars::network_mode == NETWORK_MODE::XBOXLIVE) {
@@ -957,6 +979,36 @@ dword_result_t NetDll_XNetInAddrToXnAddr_entry(dword_t caller, dword_t in_addr,
     xn_addr->inaOnline.s_addr = ntohl(in_addr);
     xn_addr->wPortOnline = kernel_state()->GetXboxLiveAPI()->GetPlayerPort();
     xn_addr->abOnline.platform_type = PLATFORM_TYPE::Xbox360;
+  }
+
+  if (cvars::network_mode == NETWORK_MODE::LAN) {
+    std::unique_lock<std::mutex> lock(lan_peers_mutex);
+    const auto it = lan_peers.find(xn_addr->ina.s_addr);
+    if (it != lan_peers.end()) {
+      const LanPeer peer = it->second;
+      lock.unlock();
+      std::memcpy(xn_addr, &peer.xnaddr, sizeof(XNADDR));
+      if (xid_ptr) {
+        const xe::be<uint64_t> session_id = peer.session_id;
+        std::memcpy(xid_ptr, &session_id, sizeof(uint64_t));
+      }
+      return X_STATUS_SUCCESS;
+    }
+    lock.unlock();
+
+    // Unknown peer and no server: FindPlayer below would block this thread
+    // on an HTTP request that cannot succeed. Answer like a 360 would for
+    // an address it only knows by IP.
+    if (!kernel_state()->GetXboxLiveAPI()->IsConnectedToServer()) {
+      xn_addr->inaOnline.s_addr = 0;
+      xn_addr->wPortOnline = 0;
+      if (xid_ptr) {
+        const xe::be<uint64_t> session_id =
+            kernel_state()->GetXboxLiveAPI()->GetSystemlinkID();
+        std::memcpy(xid_ptr, &session_id, sizeof(uint64_t));
+      }
+      return X_STATUS_SUCCESS;
+    }
   }
 
   const uint64_t cached_session_id =

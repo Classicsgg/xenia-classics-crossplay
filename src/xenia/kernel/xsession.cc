@@ -236,6 +236,15 @@ X_RESULT XSession::JoinExistingSession(XSESSION_INFO* session_info) {
     return X_ERROR_SUCCESS;
   } else if (kernel::IsOnlinePeer(session_id_)) {
     XELOGI("Joining xbox live session");
+
+    // No Xenia server to look the session up on -- e.g. a real 360 hosting
+    // a Live private match, reached through the crossplay bridge. The title
+    // already supplied the host's XNADDR (from the host's own infoResponse),
+    // so join on that, exactly as a system link join does.
+    if (!kernel_state()->GetXboxLiveAPI()->IsConnectedToServer()) {
+      XELOGI("Joining xbox live session without a server: using title's host");
+      return X_ERROR_SUCCESS;
+    }
   } else {
     XELOGI("Joining unknown session type!");
     assert_always();
@@ -397,7 +406,11 @@ X_RESULT XSession::JoinSession(XGI_SESSION_MANAGE* data) {
 
   if (!members.empty() && IsHost() && IsXboxLiveSession()) {
     kernel_state()->GetXboxLiveAPI()->SessionJoinRemote(session_id_, members);
-  } else if (!members.empty() && !IsOfflineSession()) {
+  } else if (!members.empty() && !IsOfflineSession() &&
+             kernel_state()->GetXboxLiveAPI()->IsConnectedToServer()) {
+    // Serverless system link (360 crossplay) skips this: it is a blocking
+    // HTTP call on the title's thread with no server to answer it.
+    //
     // To improve XNetInAddrToXnAddr stability each members session id
     // must match host. This is a workaround and should be fixed properly.
     //
@@ -963,7 +976,8 @@ X_RESULT XSession::EndSession(XGI_SESSION_STATE* state) {
   // The host will report TrueSkill statistics for all players in a session?
 
   // Post the remaining cached stats
-  if (stats_enabled) {
+  if (stats_enabled &&
+      kernel_state()->GetXboxLiveAPI()->IsConnectedToServer()) {
     const bool flushed = kernel_state()->GetXboxLiveAPI()->SessionFlushStats(
         session_id_, cached_stats_properties_);
 

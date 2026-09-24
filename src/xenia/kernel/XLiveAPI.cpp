@@ -45,6 +45,31 @@ DEFINE_int32(network_mode, 2,
 DEFINE_bool(bind_interface, false,
             "Useful for network Tunnels/VPNs e.g. XLink Kai.", "Live");
 
+// Crossplay bridge to a real (RGH) Xbox 360 host. Guest UDP bound for
+// bridge_peer_ip (or broadcast) goes to the relay at bridge_address instead,
+// and the relay's replies are presented to the guest as coming from
+// bridge_peer_ip on the receiving socket's own port.
+DEFINE_bool(bridge_enabled, false,
+            "Route system link traffic for bridge_peer_ip through the relay at "
+            "bridge_address (360 crossplay).",
+            "Live");
+
+DEFINE_string(bridge_address, "",
+              "Crossplay relay IP:PORT e.g. 192.168.86.25:31000", "Live");
+
+DEFINE_string(bridge_key, "",
+              "Shared passphrase for the crossplay relay (must match its --key).",
+              "Live");
+
+DEFINE_path(bridge_stats_file, "",
+            "CoD4 .mpdata (8 KB) loaded into the client's stats when it "
+            "connects through the bridge: custom classes without Xbox Live.",
+            "Live");
+
+DEFINE_string(bridge_peer_ip, "",
+              "IP the 360 host advertises (its XNADDR ina) e.g. 192.168.86.26",
+              "Live");
+
 DEFINE_bool(xstorage_backend, true,
             "Request XStorage content from backend and fallback locally, "
             "otherwise only use local content.",
