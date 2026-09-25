@@ -11,6 +11,8 @@
 
 #include <cstring>
 #include <mutex>
+#include <chrono>
+#include <thread>
 #include <string_view>
 #include <atomic>
 #include <random>
@@ -26,6 +28,7 @@
 #endif
 #endif
 #include "xenia/kernel/kernel_state.h"
+#include "xenia/kernel/xbridge.h"
 #include "xenia/kernel/xam/xam_module.h"
 #include "xenia/kernel/xboxkrnl/xboxkrnl_threading.h"
 
@@ -34,276 +37,11 @@ DECLARE_bool(bind_interface);
 DECLARE_bool(logging);
 
 DECLARE_bool(bridge_enabled);
-DECLARE_string(bridge_address);
-DECLARE_string(bridge_peer_ip);
-DECLARE_path(bridge_stats_file);
-DECLARE_string(bridge_key);
 
 using namespace std::chrono_literals;
 
 namespace xe {
 namespace kernel {
-
-// 360 crossplay bridge. The guest keeps talking to the 360 host's real
-// address; only the host socket layer knows a relay sits in between.
-//   send: destination bridge_peer_ip:* or 255.255.255.255:* -> bridge_address
-//   recv: source bridge_address -> bridge_peer_ip:<this socket's port>
-// The 360's ports are symmetric (1000 VDP / 1001 system link / 1013), so a
-// reply "from" the receiving socket's own port is what the guest expects.
-namespace {
-
-struct BridgeConfig {
-  bool enabled = false;
-  sockaddr_in relay = {};
-  in_addr peer = {};
-  uint32_t key_tag = 0;
-};
-
-// FNV-1a of bridge_key. The relay drops datagrams whose header carries a
-// different tag, so a relay port open to the internet only feeds the 360's
-// engine from Xenia builds configured with the same key. It is a shared
-// passphrase, not authentication: the tag rides in clear text.
-uint32_t BridgeKeyTag(const std::string& key) {
-  uint32_t h = 2166136261u;
-  for (unsigned char c : key) {
-    h = (h ^ c) * 16777619u;
-  }
-  return h;
-}
-
-// The 360 host's own address (its XNADDR ina), learned from the host's
-// infoResponse the first time one arrives through the relay -- so players
-// never have to configure it, and a console that gets a new LAN IP just
-// works. bridge_peer_ip, when set, overrides it. Network byte order; 0 =
-// not learned yet (discovery still works: broadcast getinfo is redirected
-// regardless).
-std::atomic<uint32_t> bridge_learned_peer{0};
-
-BridgeConfig GetBridgeConfig() {
-  static std::mutex mutex;
-  static BridgeConfig config;
-  static std::string parsed_address;
-  static std::string parsed_peer;
-  static std::string parsed_key;
-  static bool parsed = false;
-
-  std::lock_guard<std::mutex> lock(mutex);
-  if (!parsed || parsed_address != cvars::bridge_address ||
-      parsed_peer != cvars::bridge_peer_ip || parsed_key != cvars::bridge_key) {
-    parsed = true;
-    parsed_address = cvars::bridge_address;
-    parsed_peer = cvars::bridge_peer_ip;
-    parsed_key = cvars::bridge_key;
-    config = {};
-
-    const size_t colon = parsed_address.rfind(':');
-    const std::string ip = parsed_address.substr(0, colon);
-    const int port = colon == std::string::npos
-                         ? 0
-                         : std::atoi(parsed_address.c_str() + colon + 1);
-    if (port <= 0 || port > 0xFFFF ||
-        inet_pton(AF_INET, ip.c_str(), &config.relay.sin_addr) != 1 ||
-        (!parsed_peer.empty() &&
-         inet_pton(AF_INET, parsed_peer.c_str(), &config.peer) != 1)) {
-      if (cvars::bridge_enabled) {
-        XELOGE("Bridge: bad bridge_address '{}' or bridge_peer_ip '{}'",
-               parsed_address, parsed_peer);
-      }
-      config = {};
-    } else {
-      config.relay.sin_family = AF_INET;
-      config.relay.sin_port = htons(static_cast<uint16_t>(port));
-      config.key_tag = BridgeKeyTag(parsed_key);
-      XELOGI("Bridge: 360 host {} is reached through relay {}:{}",
-             parsed_peer.empty() ? "(learned from its infoResponse)"
-                                 : parsed_peer,
-             ip, port);
-    }
-  }
-  BridgeConfig result = config;
-  result.enabled = cvars::bridge_enabled && config.relay.sin_port != 0;
-  if (!result.peer.s_addr) {
-    result.peer.s_addr = bridge_learned_peer.load(std::memory_order_relaxed);
-  }
-  return result;
-}
-
-// Edit A: send to the relay instead of the 360 (or the LAN broadcast).
-// Returns true when the datagram now goes to the relay, which then needs the
-// bridge header in front of it (BridgeMakeHeader).
-bool BridgeRedirectSend(sockaddr* host_addr) {
-  const BridgeConfig bridge = GetBridgeConfig();
-  sockaddr_in* addr_in = reinterpret_cast<sockaddr_in*>(host_addr);
-  if (!bridge.enabled || addr_in->sin_family != AF_INET) {
-    return false;
-  }
-  if ((bridge.peer.s_addr && addr_in->sin_addr.s_addr == bridge.peer.s_addr) ||
-      addr_in->sin_addr.s_addr == INADDR_BROADCAST) {
-    addr_in->sin_addr = bridge.relay.sin_addr;
-    addr_in->sin_port = bridge.relay.sin_port;
-    return true;
-  }
-  return false;
-}
-
-// Every datagram to the relay starts with this header (all big-endian):
-//   u8 'X', u8 'B', u8 version (1), u8 flags (bit0 = sent from a VDP socket),
-//   u16 guest port of the sending socket, u32 instance token, u32 key tag.
-// The token (random per Xenia run) is how the relay tells players apart --
-// behind NAT one Xenia's 1000/1001/1013 sockets arrive from unrelated public
-// ports, and the source port can no longer say which socket is VDP. The
-// guest's own bytes follow untouched; replies from the relay carry no header.
-constexpr size_t kBridgeHeaderSize = 14;
-
-uint32_t BridgeInstanceToken() {
-  static const uint32_t token = [] {
-    std::random_device rd;
-    uint32_t t = 0;
-    while (!t) {
-      t = rd();
-    }
-    return t;
-  }();
-  return token;
-}
-
-void BridgeMakeHeader(uint8_t* out, uint16_t guest_port, bool vdp) {
-  const uint32_t token = BridgeInstanceToken();
-  const uint32_t tag = GetBridgeConfig().key_tag;
-  out[0] = 'X';
-  out[1] = 'B';
-  out[2] = 1;
-  out[3] = vdp ? 1 : 0;
-  out[4] = uint8_t(guest_port >> 8);
-  out[5] = uint8_t(guest_port);
-  for (int i = 0; i < 4; i++) {
-    out[6 + i] = uint8_t(token >> (24 - 8 * i));
-    out[10 + i] = uint8_t(tag >> (24 - 8 * i));
-  }
-}
-
-// The host's infoResponse (retail sub_821FF618) carries its XNADDR as
-// "\\xnaddr\\" + 9 x "%08x"; the first dword is ina, the address titles
-// then connect to (XNetXnAddrToInAddr, LAN mode). Learn it from any
-// relay-sourced infoResponse -- plain on the system link socket, or behind a
-// 2-byte VDP length on the game socket.
-void BridgeLearnPeer(const uint8_t* data, size_t len) {
-  static const char kInfo[] = "infoResponse";
-  static const char kKey[] = "\\xnaddr\\";
-  for (size_t off : {size_t(0), size_t(2)}) {
-    if (len < off + 4 + sizeof(kInfo) - 1 ||
-        std::memcmp(data + off, "\xFF\xFF\xFF\xFF", 4) ||
-        std::memcmp(data + off + 4, kInfo, sizeof(kInfo) - 1)) {
-      continue;
-    }
-    const std::string_view text(reinterpret_cast<const char*>(data) + off,
-                                len - off);
-    const size_t at = text.find(kKey);
-    if (at == std::string_view::npos ||
-        text.size() < at + sizeof(kKey) - 1 + 8) {
-      return;
-    }
-    uint32_t ina = 0;
-    const char* hex = text.data() + at + sizeof(kKey) - 1;
-    for (int i = 0; i < 8; i++) {
-      const char c = hex[i];
-      const int v = c >= '0' && c <= '9'   ? c - '0'
-                    : c >= 'a' && c <= 'f' ? c - 'a' + 10
-                    : c >= 'A' && c <= 'F' ? c - 'A' + 10
-                                           : -1;
-      if (v < 0) {
-        return;
-      }
-      ina = (ina << 4) | uint32_t(v);
-    }
-    const uint32_t net = htonl(ina);
-    if (!ina || bridge_learned_peer.exchange(net) == net) {
-      return;
-    }
-    in_addr addr = {};
-    addr.s_addr = net;
-    char ip[INET_ADDRSTRLEN] = {};
-    inet_ntop(AF_INET, &addr, ip, sizeof(ip));
-    XELOGI("Bridge: 360 host is {} (from its infoResponse){}", ip,
-           cvars::bridge_peer_ip.empty() ? "" : " -- bridge_peer_ip overrides it");
-    return;
-  }
-}
-
-// Edit B: a datagram from the relay is the 360 answering on our port.
-void BridgeMapSource(sockaddr* host_addr, uint16_t local_port,
-                     const uint8_t* data, size_t len) {
-  sockaddr_in* addr_in = reinterpret_cast<sockaddr_in*>(host_addr);
-  const BridgeConfig relay_check = GetBridgeConfig();
-  if (!relay_check.enabled || addr_in->sin_family != AF_INET ||
-      addr_in->sin_addr.s_addr != relay_check.relay.sin_addr.s_addr ||
-      addr_in->sin_port != relay_check.relay.sin_port) {
-    return;
-  }
-  // Learn first, so even the very first reply is presented as the host.
-  if (data && len) {
-    BridgeLearnPeer(data, len);
-  }
-  const BridgeConfig bridge = GetBridgeConfig();
-  if (bridge.peer.s_addr) {
-    addr_in->sin_addr = bridge.peer;
-    addr_in->sin_port = htons(local_port);
-  }
-}
-
-// CoD4 (415607E6) offline stats for a bridged client. A real 360 in our
-// lobbies runs the Lite plugin, which fills the client's stats block and sets
-// statsFetched; Xenia is never signed in to Live, so the block stays zero:
-// the custom-class menu parks on "Downloading game settings" and the host
-// receives an all-zero stats upload. The upload (CL_CheckForResend, retail
-// sub_822D1870) starts right after connectResponse, so the moment the guest
-// sends its OOB "connect" through the bridge is the last safe point to fill
-// controllerStatData[c] (retail 0x84C5E238, stride 0x421C: 8 KB playerStats,
-// statsFetched at +0x4218) for every controller.
-void BridgeLoadCod4Stats(const uint8_t* data, size_t len) {
-  if (!GetBridgeConfig().enabled || cvars::bridge_stats_file.empty() ||
-      kernel_state()->title_id() != 0x415607E6) {
-    return;
-  }
-  // OOB packets on the game socket are VDP framed: [u16 cbGameData] first.
-  for (size_t off : {size_t(0), size_t(2)}) {
-    if (len < off + 12 || std::memcmp(data + off, "\xFF\xFF\xFF\xFF" "connect ", 12)) {
-      continue;
-    }
-    constexpr uint32_t kStatData = 0x84C5E238;
-    constexpr uint32_t kStride = 0x421C;
-    constexpr uint32_t kStatsFetched = 0x4218;
-    constexpr size_t kStatsSize = 0x2000;
-
-    std::vector<uint8_t> blob(kStatsSize);
-    FILE* file = xe::filesystem::OpenFile(cvars::bridge_stats_file, "rb");
-    const size_t read =
-        file ? std::fread(blob.data(), 1, blob.size(), file) : 0;
-    if (file) {
-      std::fclose(file);
-    }
-    if (read != kStatsSize) {
-      XELOGE("Bridge: {} is not an 8 KB .mpdata stats block",
-             xe::path_to_utf8(cvars::bridge_stats_file));
-      return;
-    }
-
-    Memory* memory = kernel_state()->memory();
-    for (uint32_t c = 0; c < 4; c++) {
-      uint8_t* block = memory->TranslateVirtual<uint8_t*>(kStatData + c * kStride);
-      XELOGI("Bridge: controller {} statsFetched was {}, stat 205 was {}", c,
-             block[kStatsFetched], block[4 + 205]);
-      std::memcpy(block, blob.data(), kStatsSize);
-      block[kStatsFetched] = 1;      // statsFetched
-      block[kStatsFetched + 1] = 0;  // statWriteNeeded
-    }
-    XELOGI("Bridge: loaded CoD4 stats from {} before connect",
-           xe::path_to_utf8(cvars::bridge_stats_file));
-    return;
-  }
-}
-
-}  // namespace
 
 // Translate socket options to native
 // Note:
@@ -552,7 +290,7 @@ X_STATUS XSocket::Connect(const XSOCKADDR_IN* name, int name_len) {
   sockaddr addr = sa_in.to_host();
 
   if (proto_ == X_IPPROTO_UDP) {
-    BridgeRedirectSend(&addr);
+    bridge::RedirectSend(&addr);
   }
 
   int ret = connect(native_handle_, &addr, name_len);
@@ -702,7 +440,7 @@ int XSocket::RecvFrom(uint8_t* buf, uint32_t buf_len, uint32_t flags,
 
   if (from) {
     if (proto_ == X_IPPROTO_UDP && ret > 0) {
-      BridgeMapSource(&sa, bound_port_, buf, size_t(ret));
+      bridge::MapSource(&sa, bound_port_, buf, size_t(ret));
     }
     from->to_guest(&sa);
   }
@@ -826,19 +564,19 @@ int XSocket::PollWSASendTo(bool wait, WSASendToData send_async_data,
     }
   }
 
-  uint8_t bridge_header[kBridgeHeaderSize];
+  uint8_t bridge_header[bridge::kHeaderSize];
   bool bridged = false;
   if (proto_ == X_IPPROTO_UDP) {
-    bridged = BridgeRedirectSend(&saddr);
-    if (send_async_data.num_buffers) {
-      BridgeLoadCod4Stats(reinterpret_cast<const uint8_t*>(buffers[0].buf),
-                          buffers[0].len);
-    }
+    const bool has_data = send_async_data.num_buffers != 0;
+    bridged = bridge::OnGuestSend(
+        &saddr,
+        has_data ? reinterpret_cast<const uint8_t*>(buffers[0].buf) : nullptr,
+        has_data ? buffers[0].len : 0);
   }
   if (bridged) {
-    BridgeMakeHeader(bridge_header, bound_port_, vdp_);
+    bridge::MakeHeader(bridge_header, bound_port_, vdp_);
     buffers.insert(buffers.begin(),
-                   WSABUF{ULONG(kBridgeHeaderSize),
+                   WSABUF{ULONG(bridge::kHeaderSize),
                           reinterpret_cast<CHAR*>(bridge_header)});
   }
 
@@ -847,8 +585,8 @@ int XSocket::PollWSASendTo(bool wait, WSASendToData send_async_data,
       &saddr, send_async_data.to_len, nullptr, nullptr);
 
   // The title sent its own buffers; the header is ours.
-  if (bridged && bytes_sent >= kBridgeHeaderSize) {
-    bytes_sent -= DWORD(kBridgeHeaderSize);
+  if (bridged && bytes_sent >= bridge::kHeaderSize) {
+    bytes_sent -= DWORD(bridge::kHeaderSize);
   }
 
   // Implicit Bind
@@ -1135,7 +873,7 @@ int XSocket::PollWSARecvFrom(bool wait, WSARecvFromData receive_async_data) {
         socklen_t peer_addar_len = sizeof(sockaddr);
         getpeername(native_handle_, &saddr, &peer_addar_len);
       } else {
-        BridgeMapSource(
+        bridge::MapSource(
             &saddr, bound_port_,
             reinterpret_cast<const uint8_t*>(recv_buffer.buf), bytes_received);
       }
@@ -1549,20 +1287,19 @@ int XSocket::SendTo(uint8_t* buf, uint32_t buf_len, uint32_t flags,
 
   bool bridged = false;
   if (to && proto_ == X_IPPROTO_UDP) {
-    bridged = BridgeRedirectSend(&addr);
-    BridgeLoadCod4Stats(buf, buf_len);
+    bridged = bridge::OnGuestSend(&addr, buf, buf_len);
   }
 
   int ret;
   if (bridged) {
-    std::vector<uint8_t> packet(kBridgeHeaderSize + buf_len);
-    BridgeMakeHeader(packet.data(), bound_port_, vdp_);
-    std::memcpy(packet.data() + kBridgeHeaderSize, buf, buf_len);
+    std::vector<uint8_t> packet(bridge::kHeaderSize + buf_len);
+    bridge::MakeHeader(packet.data(), bound_port_, vdp_);
+    std::memcpy(packet.data() + bridge::kHeaderSize, buf, buf_len);
     ret = sendto(native_handle_, reinterpret_cast<char*>(packet.data()),
                  int(packet.size()), flags, &addr, to_len);
     // The title sent buf_len bytes; the header is ours.
-    if (ret >= int(kBridgeHeaderSize)) {
-      ret -= int(kBridgeHeaderSize);
+    if (ret >= int(bridge::kHeaderSize)) {
+      ret -= int(bridge::kHeaderSize);
     }
   } else {
     ret = sendto(native_handle_, reinterpret_cast<char*>(buf), buf_len, flags,

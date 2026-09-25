@@ -55,10 +55,18 @@ DEFINE_bool(bridge_enabled, false,
             "Live");
 
 DEFINE_string(bridge_address, "",
-              "Crossplay relay IP:PORT e.g. 192.168.86.25:31000", "Live");
+              "Crossplay relay HOST:PORT. From another network: the host's "
+              "public IP or DNS name, e.g. myname.duckdns.org:31000. On the "
+              "host's LAN: the relay PC's LAN IP.",
+              "Live");
 
 DEFINE_string(bridge_key, "",
               "Shared passphrase for the crossplay relay (must match its --key).",
+              "Live");
+
+DEFINE_string(bridge_class_names, "",
+              "CoD4 custom class names shown in the class menu, comma "
+              "separated (up to 5), e.g. \"AR,SMG,Sniper,Shotgun,LMG\".",
               "Live");
 
 DEFINE_path(bridge_stats_file, "",
