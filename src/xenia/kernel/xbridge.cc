@@ -13,6 +13,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <map>
 #include <mutex>
@@ -302,7 +303,8 @@ class ControlChannel {
     std::snprintf(hex, sizeof(hex), "%08X", title_id);
     body += "\ntitle=";
     body += hex;
-    body += "\nbuild=xenia-netplay " __DATE__;
+    body += "\nbuild=" + std::to_string(kCrossplayBuild);
+    body += "\nbuild_name=xenia-netplay " __DATE__;
     // Class names: trimmed to 20 characters and stripped of quotes,
     // backslashes, semicolons and control characters -- they end up inside
     // a server command on the host.
@@ -379,15 +381,45 @@ class ControlChannel {
         const std::string text = get("text");
         XELOGE("Bridge: the relay refused this player ({}): {}", get("reason"),
                text);
-        Notify("Crossplay: can't join", text.empty() ? get("reason") : text,
-               kProblemNoticeMs);
+        Notify(get("reason") == "outdated" ? "Crossplay: update needed"
+                                           : "Crossplay: can't join",
+               text.empty() ? get("reason") : text, kProblemNoticeMs);
       }
       return;
     }
     if (verb != "status") {
       return;
     }
-    const bool host_up = get("host") == "up";
+
+    // Version contract, the other direction: warn once if the host's relay
+    // is older than this build expects (a pre-contract relay sends no
+    // relay_build at all).
+    const uint32_t relay_build =
+        uint32_t(std::strtoul(get("relay_build").c_str(), nullptr, 10));
+    if (relay_build < kMinRelayBuild && !warned_relay_) {
+      warned_relay_ = true;
+      XELOGW("Bridge: the host's relay is build {}; this Xenia build ({}) needs "
+             "relay build {} or newer",
+             relay_build, kCrossplayBuild, kMinRelayBuild);
+      Notify("Crossplay: host relay out of date",
+             "The host's relay is older than this Xenia build needs. Ask the "
+             "host to update the crossplay relay.",
+             kProblemNoticeMs);
+    }
+
+    const std::string host = get("host");
+    const bool host_up = host == "up";
+    if (host == "outdated") {
+      if (state_ != "outdated") {
+        state_ = "outdated";
+        XELOGW("Bridge: the host's console plugin is too old for its relay");
+        Notify("Crossplay: host plugin out of date",
+               "The host's console plugin is older than their relay needs. "
+               "Ask the host to update ClassicsRanked.",
+               kProblemNoticeMs);
+      }
+      return;
+    }
     const std::string state = host_up ? "up" : "down";
     const std::string summary = "host " + state + ", " + get("players") + "/" +
                                 get("max") + " crossplay players" +
@@ -489,7 +521,7 @@ class ControlChannel {
         Notify("Crossplay: no answer from relay",
                "Nothing came back from " + where +
                    ". Check bridge_address in the config, and ask the host "
-                   "whether the relay is running.",
+                   "whether the relay is running and up to date.",
                kProblemNoticeMs);
       }
     }
@@ -502,6 +534,7 @@ class ControlChannel {
   // Control-thread only:
   std::string state_;    // "", "up", "down", "silent", "reject:<reason>"
   std::string summary_;
+  bool warned_relay_ = false;
   std::chrono::steady_clock::time_point last_reply_{};
 };
 
@@ -545,6 +578,8 @@ void StartControl() {
   if (!GetConfig().enabled) {
     return;
   }
+  XELOGI("Bridge: crossplay build {} (protocol {}), expects relay build {}+",
+         kCrossplayBuild, kProtocol, kMinRelayBuild);
   ControlChannel& control = ControlChannel::Get();
   control.EnsureRunning();
   control.HelloNow();

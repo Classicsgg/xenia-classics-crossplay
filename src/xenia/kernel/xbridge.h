@@ -45,6 +45,22 @@ namespace bridge {
 
 constexpr size_t kHeaderSize = 14;
 constexpr uint8_t kProtocol = 2;
+
+// ---------------------------------------------------------------------------
+// CROSSPLAY BUILD NUMBER -- BUMP IT WITH EVERY CHANGE THAT SHIPS.
+// ---------------------------------------------------------------------------
+// One integer, only ever increasing, sent in every hello. The relay refuses
+// builds below its MIN_XENIA_BUILD with "Crossplay: update needed". Any
+// change to the crossplay bridge (xbridge*, the bridge edits in xsocket.cc /
+// xsession.cc / xam_net.cc, their cvars) that goes to players bumps this by
+// one and gets a line in ClassicsConsole0 docs/crossplay/VERSIONING.md.
+constexpr uint32_t kCrossplayBuild = 1;
+
+// Oldest relay (xbridge/versions.py RELAY_BUILD) this build is known to work
+// with. An older relay still gets to try, but the player is told the host's
+// relay is out of date. Raise it when this build needs something new from
+// the relay.
+constexpr uint32_t kMinRelayBuild = 1;
 constexpr uint8_t kFlagVdp = 1;
 constexpr uint8_t kFlagControl = 2;
 
