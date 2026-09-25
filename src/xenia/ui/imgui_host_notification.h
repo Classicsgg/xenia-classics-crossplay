@@ -43,6 +43,10 @@ class HostNotificationWindow final : ImGuiHostNotification {
       : ImGuiHostNotification(imgui_drawer, title, description, user_index,
                               position_id) {};
 
+  // Keep this notification up longer (or shorter) than the 4.5 s default.
+  // Used by the crossplay bridge for notices a player has to read and act on.
+  void SetDuration(uint32_t milliseconds) { SetTimeToClose(milliseconds); }
+
   void OnDraw(ImGuiIO& io) override;
 };
 

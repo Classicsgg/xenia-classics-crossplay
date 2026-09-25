@@ -81,6 +81,9 @@ class ImGuiNotification {
     creation_time_ = new_creation_time;
   }
 
+  // How long the notification stays up, in ms (default 4500).
+  void SetTimeToClose(uint32_t milliseconds) { time_to_close_ = milliseconds; }
+
   const bool IsMarkedForDeletion() const { return marked_for_deletion_; }
   std::string_view GetTitle() const { return title_; }
   std::string_view GetDescription() const { return description_; }

@@ -54,6 +54,12 @@ constexpr uint8_t kFlagControl = 2;
 // MakeHeader() in front of it.
 bool OnGuestSend(sockaddr* to, const uint8_t* data, size_t len);
 
+// Title launch (Emulator, right after XLiveAPI::Init): start the control
+// channel so the relay pre-flight -- "relay connected, open System Link" or
+// "no answer from relay" -- shows before the player goes looking for a match.
+// No-op unless bridge_enabled.
+void StartControl();
+
 // connect() on a UDP socket: redirect only (no header path for send()).
 bool RedirectSend(sockaddr* to);
 

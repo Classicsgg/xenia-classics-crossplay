@@ -43,6 +43,7 @@
 #include "xenia/kernel/kernel_state.h"
 #include "xenia/kernel/title_id_utils.h"
 #include "xenia/kernel/user_module.h"
+#include "xenia/kernel/xbridge.h"
 #include "xenia/kernel/xam/achievement_manager.h"
 #include "xenia/kernel/xam/xam_module.h"
 #include "xenia/kernel/xam/xdbf/spa_info.h"
@@ -1871,6 +1872,10 @@ X_STATUS Emulator::CompleteLaunch(const std::filesystem::path& path,
   // Initialize before title calls any XNet functions that depend on XNADDR e.g.
   // NetDll_XNetGetTitleXnAddr
   kernel_state()->GetXboxLiveAPI()->Init();
+
+  // Crossplay bridge pre-flight: tell the player whether the relay and the
+  // 360 host are reachable before they open System Link (xbridge.h).
+  kernel::bridge::StartControl();
 
   kernel_state()->xam_state()->StartPeriodicMaintenance();
 

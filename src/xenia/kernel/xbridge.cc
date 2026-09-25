@@ -241,25 +241,33 @@ bool IsOobConnect(const uint8_t* data, size_t len) {
   return false;
 }
 
-void Notify(std::string title, std::string text) {
+// Crossplay notices carry instructions ("open System Link", "check
+// bridge_address"), so they stay up longer than Xenia's 4.5 s default.
+constexpr uint32_t kNoticeMs = 10000;
+constexpr uint32_t kProblemNoticeMs = 15000;  // rejects, relay not answering
+
+void Notify(std::string title, std::string text,
+            uint32_t duration_ms = kNoticeMs) {
   Emulator* emulator = kernel_state() ? kernel_state()->emulator() : nullptr;
   if (!emulator || !emulator->display_window() || !emulator->imgui_drawer()) {
     return;
   }
   emulator->display_window()->app_context().CallInUIThread(
-      [emulator, title, text]() {
-        new xe::ui::HostNotificationWindow(emulator->imgui_drawer(), title,
-                                           text, 0);
+      [emulator, title, text, duration_ms]() {
+        auto* window = new xe::ui::HostNotificationWindow(
+            emulator->imgui_drawer(), title, text, 0);
+        window->SetDuration(duration_ms);
       });
 }
 
 // ---- control channel ------------------------------------------------------
 // A socket of our own (never the guest's), so control traffic never mixes
-// with game datagrams in either direction. It says hello to the relay every
-// kHelloEvery -- and at once when the guest connects to a host -- and the
-// relay answers "status" (host up/down, title, players) or "reject" (wrong
-// key, wrong game, lobby full). Changes are logged; the ones a player must
-// act on also show as an on-screen notification.
+// with game datagrams in either direction. It says hello to the relay at
+// title launch (StartControl), every kHelloEvery after that, and at once when
+// the guest connects to a host; the relay answers "status" (host up/down,
+// title, players) or "reject" (wrong key, wrong game, lobby full). Changes
+// are logged; the ones a player must act on also show as an on-screen
+// notification.
 //
 //   hello   proto, title (hex), build, class1..class5 (bridge_class_names)
 //   status  proto, host (up|down), title, players, max, [peer]
@@ -371,7 +379,8 @@ class ControlChannel {
         const std::string text = get("text");
         XELOGE("Bridge: the relay refused this player ({}): {}", get("reason"),
                text);
-        Notify("Crossplay: can't join", text.empty() ? get("reason") : text);
+        Notify("Crossplay: can't join", text.empty() ? get("reason") : text,
+               kProblemNoticeMs);
       }
       return;
     }
@@ -480,7 +489,8 @@ class ControlChannel {
         Notify("Crossplay: no answer from relay",
                "Nothing came back from " + where +
                    ". Check bridge_address in the config, and ask the host "
-                   "whether the relay is running.");
+                   "whether the relay is running.",
+               kProblemNoticeMs);
       }
     }
   }
@@ -488,7 +498,7 @@ class ControlChannel {
   std::once_flag started_;
   std::mutex mutex_;
   std::condition_variable wake_;
-  bool hello_now_ = false;
+  bool hello_now_ = true;  // first hello goes out at once, not after kHelloEvery
   // Control-thread only:
   std::string state_;    // "", "up", "down", "silent", "reject:<reason>"
   std::string summary_;
@@ -530,6 +540,15 @@ void LearnPeer(const uint8_t* data, size_t len) {
 }  // namespace
 
 bool RedirectSend(sockaddr* to) { return RedirectToRelay(to); }
+
+void StartControl() {
+  if (!GetConfig().enabled) {
+    return;
+  }
+  ControlChannel& control = ControlChannel::Get();
+  control.EnsureRunning();
+  control.HelloNow();
+}
 
 bool OnGuestSend(sockaddr* to, const uint8_t* data, size_t len) {
   if (!RedirectToRelay(to)) {
