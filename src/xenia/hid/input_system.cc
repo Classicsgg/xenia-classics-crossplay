@@ -11,6 +11,9 @@
 
 #include "xenia/hid/input_system.h"
 
+#include <algorithm>
+#include <cstdlib>
+
 #include "xenia/base/profiling.h"
 #include "xenia/hid/hid_flags.h"
 #include "xenia/hid/input_driver.h"
@@ -121,17 +124,54 @@ X_RESULT InputSystem::GetState(uint32_t user_index, uint32_t flags,
     return X_ERROR_DEVICE_NOT_CONNECTED;
   }
 
+  InputDriver* answered = nullptr;
   for (auto& driver : filtered_drivers) {
-    X_RESULT result = driver->GetState(user_index, out_state);
-    if (result == X_ERROR_SUCCESS) {
-      UpdateUsedSlot(driver, user_index, true);
-      AdjustDeadzoneLevels(user_index, &out_state->gamepad);
-
-      if (out_state->gamepad.buttons != 0) {
-        last_used_slot = user_index;
-      }
-      return result;
+    if (driver->MergesWithOtherDrivers()) {
+      continue;
     }
+    if (driver->GetState(user_index, out_state) == X_ERROR_SUCCESS) {
+      answered = driver;
+      break;
+    }
+  }
+  // Crossplay KBM: combine with the pad rather than compete for the slot.
+  for (auto& driver : filtered_drivers) {
+    if (!driver->MergesWithOtherDrivers()) {
+      continue;
+    }
+    X_INPUT_STATE extra = {};
+    if (driver->GetState(user_index, &extra) != X_ERROR_SUCCESS) {
+      continue;
+    }
+    if (!answered) {
+      *out_state = extra;
+      answered = driver;
+      continue;
+    }
+    auto& pad = out_state->gamepad;
+    const auto& more = extra.gamepad;
+    auto stronger = [](int16_t a, int16_t b) {
+      return std::abs(int32_t(b)) > std::abs(int32_t(a)) ? b : a;
+    };
+    pad.buttons = pad.buttons | more.buttons;
+    pad.left_trigger = std::max(pad.left_trigger, more.left_trigger);
+    pad.right_trigger = std::max(pad.right_trigger, more.right_trigger);
+    pad.thumb_lx = stronger(pad.thumb_lx, more.thumb_lx);
+    pad.thumb_ly = stronger(pad.thumb_ly, more.thumb_ly);
+    pad.thumb_rx = stronger(pad.thumb_rx, more.thumb_rx);
+    pad.thumb_ry = stronger(pad.thumb_ry, more.thumb_ry);
+    // Both counters only go up, so the sum changes whenever either state
+    // does -- the guest skips polls whose packet number didn't move.
+    out_state->packet_number = out_state->packet_number + extra.packet_number;
+  }
+  if (answered) {
+    UpdateUsedSlot(answered, user_index, true);
+    AdjustDeadzoneLevels(user_index, &out_state->gamepad);
+
+    if (out_state->gamepad.buttons != 0) {
+      last_used_slot = user_index;
+    }
+    return X_ERROR_SUCCESS;
   }
   UpdateUsedSlot(nullptr, user_index, false);
   return X_ERROR_DEVICE_NOT_CONNECTED;

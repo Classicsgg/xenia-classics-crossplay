@@ -74,6 +74,19 @@ DEFINE_path(bridge_stats_file, "",
             "connects through the bridge: custom classes without Xbox Live.",
             "Live");
 
+DEFINE_bool(bridge_mw2_unlock_all, true,
+            "MW2 crossplay: raise the offline (System Link) profile to max "
+            "level with everything unlocked, so custom classes can be built in "
+            "System Link > Create a Class before joining the host.",
+            "Live");
+
+DEFINE_bool(bridge_fake_live, false,
+            "Crossplay: report the profile as signed in to Xbox Live while "
+            "staying in System Link mode with no WebServices server, so the "
+            "game can join a 360 host's Live private-match party through the "
+            "relay. The profile must be Live-enabled. Needs bridge_enabled.",
+            "Live");
+
 DEFINE_string(bridge_peer_ip, "",
               "IP the 360 host advertises (its XNADDR ina) e.g. 192.168.86.26",
               "Live");
@@ -154,7 +167,12 @@ void XLiveAPI::IpGetConsoleXnAddr(XNADDR* XnAddr_ptr) {
   const auto xbl_api = kernel_state()->GetXboxLiveAPI();
   const auto user_tracker = kernel_state()->xam_state()->user_tracker();
 
-  if (user_tracker->LoggedInToLive()) {
+  if (user_tracker->LoggedInToLive() && BridgeFakeLive() &&
+      !xbl_api->OnlineIP().sin_addr.s_addr) {
+    // Crossplay fake Live: no whoami server, so the adapter's own address.
+    XnAddr_ptr->ina = adapter_local_ip.sin_addr;
+    XnAddr_ptr->inaOnline = adapter_local_ip.sin_addr;
+  } else if (user_tracker->LoggedInToLive()) {
     XnAddr_ptr->ina = xbl_api->OnlineIP().sin_addr;
     XnAddr_ptr->inaOnline = xbl_api->OnlineIP().sin_addr;
   } else if (cvars::network_mode == NETWORK_MODE::LAN) {
@@ -490,9 +508,21 @@ void XLiveAPI::clearXnaddrCache() {
 }
 
 // Request data from the server
+bool XLiveAPI::BridgeFakeLive() {
+  return cvars::bridge_enabled && cvars::bridge_fake_live;
+}
+
 std::unique_ptr<HTTPResponseObjectJSON> XLiveAPI::Get(std::string endpoint,
                                                       uint32_t timeout) {
   response_data chunk = {};
+
+  // Crossplay fake Live: there is no server, and an unanswered request stalls
+  // the calling thread for curl's ~300 s connect timeout. Post and Delete
+  // already bail out like this.
+  if (BridgeFakeLive() && GetInitState() == InitState::Failed) {
+    return PraseResponse(chunk);
+  }
+
   CURL* curl_handle = curl_easy_init();
   CURLcode result;
 
@@ -673,6 +703,9 @@ std::unique_ptr<HTTPResponseObjectJSON> XLiveAPI::Delete(std::string endpoint) {
 
 std::vector<HTTPResponseObjectJSON> XLiveAPI::GetMulti(
     std::vector<std::string> urls, uint32_t per_request_timeout) {
+  if (BridgeFakeLive() && GetInitState() == InitState::Failed) {
+    return {};  // crossplay fake Live: no server (see Get)
+  }
   CURLM* curl_multi_handle = curl_multi_init();
   CURLMcode result;
 

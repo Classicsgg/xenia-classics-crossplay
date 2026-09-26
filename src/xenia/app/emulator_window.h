@@ -20,6 +20,7 @@
 #include "xenia/app/updater_dialog.h"
 #include "xenia/emulator.h"
 #include "xenia/gpu/command_processor.h"
+#include "xenia/hid/crossplay_input.h"
 #include "xenia/ui/imgui_dialog.h"
 #include "xenia/ui/imgui_drawer.h"
 #include "xenia/ui/immediate_drawer.h"
@@ -114,6 +115,8 @@ class EmulatorWindow {
   void ToggleContentListDialog();
   void ToggleFriendsDialog();
   void ToggleUpdaterDialog();
+  // Netplay > Crossplay input: saved for the next start.
+  void SetCrossplayInput(hid::crossplay::Mode mode);
   void ToggleCompletionDialog();
   void ToggleNetplaySettingsDialog();
   void ToggleNetplayStatusDialog();

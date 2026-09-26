@@ -67,6 +67,8 @@
 #endif  // XE_PLATFORM_WIN32
 
 // Available input drivers:
+#include "xenia/hid/crossplay_input.h"
+#include "xenia/hid/keyboard/keyboard_input_driver.h"
 #if XE_PLATFORM_LINUX
 #include "xenia/hid/keyboard/keyboard_hid.h"
 #endif  // XE_PLATFORM_LINUX
@@ -76,6 +78,7 @@
 #endif  // !XE_PLATFORM_ANDROID
 #if XE_PLATFORM_WIN32
 #include "xenia/hid/keyboard/keyboard_hid.h"
+#include "xenia/hid/xbkbm/kbm_hid.h"
 #include "xenia/hid/xinput/xinput_hid.h"
 #endif  // XE_PLATFORM_WIN32
 
@@ -479,12 +482,35 @@ std::vector<std::unique_ptr<hid::InputDriver>> EmulatorApp::CreateInputDrivers(
     // WinKey input driver should always be the last input driver added!
     factory.Add("keyboard", xe::hid::keyboard::Create);
 #endif  // XE_PLATFORM_WIN32
-    for (auto& driver : factory.CreateAll(cvars::hid, window,
-                                          EmulatorWindow::kZOrderHidInput)) {
+    // Crossplay input policy (hid/crossplay_input.h), fixed for the life of
+    // the process. With the bridge on, Canary's keyboard driver is never
+    // created, whatever `hid` / `keyboard_mode` say: the only keyboard and
+    // mouse path into a crossplay game is the KBM driver below, which exists
+    // only when the player declared keyboard and mouse.
+    const auto crossplay = hid::crossplay::GetMode();
+    for (auto& driver : factory.CreateAll(
+             crossplay == hid::crossplay::Mode::kOff ? cvars::hid
+             : cvars::hid == "keyboard"               ? std::string("any")
+                                                      : cvars::hid,
+             window, EmulatorWindow::kZOrderHidInput)) {
+      if (crossplay != hid::crossplay::Mode::kOff &&
+          dynamic_cast<hid::keyboard::KeyboardInputDriver*>(driver.get())) {
+        XELOGI("Crossplay: keyboard input driver disabled ({} mode)",
+               hid::crossplay::ModeName(crossplay));
+        continue;
+      }
       if (XSUCCEEDED(driver->Setup())) {
         drivers.emplace_back(std::move(driver));
       }
     }
+#if XE_PLATFORM_WIN32
+    if (crossplay == hid::crossplay::Mode::kKbm) {
+      auto kbm = xe::hid::xbkbm::Create(window, EmulatorWindow::kZOrderHidInput);
+      if (XSUCCEEDED(kbm->Setup())) {
+        drivers.emplace_back(std::move(kbm));
+      }
+    }
+#endif  // XE_PLATFORM_WIN32
     if (drivers.empty()) {
       // Fallback to nop if none created.
       drivers.emplace_back(

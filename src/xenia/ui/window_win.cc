@@ -216,6 +216,9 @@ bool Win32Window::OpenImpl() {
       hwnd_, &filter,
       DEVICE_NOTIFY_WINDOW_HANDLE | DEVICE_NOTIFY_ALL_INTERFACE_CLASSES);
 
+  // Crossplay KBM: the sink may have been set before the window opened.
+  RegisterRawMouse();
+
   // Apply the initial state from the Window that the window shouldn't be
   // visibly transitioned to.
 
@@ -424,6 +427,7 @@ void Win32Window::ApplyNewFullscreen() {
       return;
     }
   }
+  UpdateRawMouseClip();
 }
 
 void Win32Window::ApplyNewTitle() {
@@ -997,6 +1001,16 @@ void Win32Window::AutoHideCursorTimerCallback(void* parameter,
 
 LRESULT Win32Window::WndProc(HWND hWnd, UINT message, WPARAM wParam,
                              LPARAM lParam) {
+  // Crossplay KBM: a left click in the client area captures the mouse. The
+  // click itself is swallowed (it only captures; it must not fire).
+  if (message == WM_LBUTTONDOWN && raw_mouse_sink() && !raw_mouse_clipped_ &&
+      !raw_mouse_suspended()) {
+    raw_mouse_armed_ = true;
+    UpdateRawMouseClip();
+    if (raw_mouse_clipped_) {
+      return 0;
+    }
+  }
   if (message >= WM_MOUSEFIRST && message <= WM_MOUSELAST) {
     WindowDestructionReceiver destruction_receiver(this);
     // Returning immediately anyway - no need to check
@@ -1073,7 +1087,27 @@ LRESULT Win32Window::WndProc(HWND hWnd, UINT message, WPARAM wParam,
       // chrispy: fix clang use of temporary error
       MonitorUpdateEvent update_event{this, false};
       OnMonitorUpdate(update_event);
+      UpdateRawMouseClip();
     } break;
+
+    // Crossplay KBM: give the cursor back while the menu bar is open or the
+    // window is being dragged / resized.
+    case WM_ENTERMENULOOP:
+      in_menu_loop_ = true;
+      UpdateRawMouseClip();
+      break;
+    case WM_EXITMENULOOP:
+      in_menu_loop_ = false;
+      UpdateRawMouseClip();
+      break;
+    case WM_ENTERSIZEMOVE:
+      in_size_move_ = true;
+      UpdateRawMouseClip();
+      break;
+    case WM_EXITSIZEMOVE:
+      in_size_move_ = false;
+      UpdateRawMouseClip();
+      break;
 
     case WM_SIZE: {
       if (batched_size_update_depth_) {
@@ -1085,6 +1119,7 @@ LRESULT Win32Window::WndProc(HWND hWnd, UINT message, WPARAM wParam,
           break;
         }
       }
+      UpdateRawMouseClip();
     } break;
 
     case WM_PAINT: {
@@ -1159,9 +1194,35 @@ LRESULT Win32Window::WndProc(HWND hWnd, UINT message, WPARAM wParam,
       }
     } break;
 
+    case WM_INPUT: {
+      // Crossplay KBM: relative mouse motion straight from the device, only
+      // while the mouse is captured -- not while the cursor is in use for the
+      // menu bar or a dialog. DefWindowProc still runs afterwards (required
+      // for RIM_INPUT).
+      if (raw_mouse_sink() && raw_mouse_clipped_) {
+        RAWINPUT raw = {};
+        UINT size = sizeof(raw);
+        if (GetRawInputData(reinterpret_cast<HRAWINPUT>(lParam), RID_INPUT,
+                            &raw, &size, sizeof(RAWINPUTHEADER)) !=
+                UINT(-1) &&
+            raw.header.dwType == RIM_TYPEMOUSE &&
+            !(raw.data.mouse.usFlags & MOUSE_MOVE_ABSOLUTE)) {
+          const RAWMOUSE& m = raw.data.mouse;
+          const int16_t wheel = (m.usButtonFlags & RI_MOUSE_WHEEL)
+                                    ? int16_t(m.usButtonData)
+                                    : int16_t(0);
+          raw_mouse_sink()(m.lLastX, m.lLastY, m.usButtonFlags, wheel);
+        }
+      }
+    } break;
+
     case WM_KILLFOCUS: {
       WindowDestructionReceiver destruction_receiver(this);
       OnFocusUpdate(false, destruction_receiver);
+      if (destruction_receiver.IsWindowDestroyedOrClosed()) {
+        break;
+      }
+      UpdateRawMouseClip();
       if (destruction_receiver.IsWindowDestroyedOrClosed()) {
         break;
       }
@@ -1173,9 +1234,19 @@ LRESULT Win32Window::WndProc(HWND hWnd, UINT message, WPARAM wParam,
       if (destruction_receiver.IsWindowDestroyedOrClosed()) {
         break;
       }
+      UpdateRawMouseClip();
+      if (destruction_receiver.IsWindowDestroyedOrClosed()) {
+        break;
+      }
     } break;
 
     case WM_SETCURSOR: {
+      // Crossplay KBM: no cursor while the mouse is captured.
+      if (raw_mouse_clipped_ && reinterpret_cast<HWND>(wParam) == hwnd_ &&
+          LOWORD(lParam) == HTCLIENT) {
+        SetCursor(nullptr);
+        return true;
+      }
       if (reinterpret_cast<HWND>(wParam) == hwnd_ && HasFocus() &&
           LOWORD(lParam) == HTCLIENT) {
         switch (GetCursorVisibility()) {
@@ -1304,6 +1375,66 @@ LRESULT CALLBACK Win32Window::WndProcThunk(HWND hWnd, UINT message,
     }
   }
   return DefWindowProc(hWnd, message, wParam, lParam);
+}
+
+void Win32Window::ApplyRawMouseSink() {
+  RegisterRawMouse();
+  UpdateRawMouseClip();
+}
+
+void Win32Window::RegisterRawMouse() {
+  if (!hwnd_) {
+    return;
+  }
+  const bool want = bool(raw_mouse_sink());
+  if (want == raw_mouse_registered_) {
+    return;
+  }
+  RAWINPUTDEVICE device = {};
+  device.usUsagePage = 0x01;  // HID_USAGE_PAGE_GENERIC
+  device.usUsage = 0x02;      // HID_USAGE_GENERIC_MOUSE
+  device.dwFlags = want ? 0 : RIDEV_REMOVE;
+  device.hwndTarget = want ? hwnd_ : nullptr;
+  if (RegisterRawInputDevices(&device, 1, sizeof(device))) {
+    raw_mouse_registered_ = want;
+  } else {
+    XELOGE("Could not {} raw mouse input: error {}",
+           want ? "register" : "unregister", GetLastError());
+  }
+}
+
+void Win32Window::UpdateRawMouseClip() {
+  bool want = hwnd_ && raw_mouse_sink() && HasFocus() &&
+              !raw_mouse_suspended() && !in_menu_loop_ && !in_size_move_ &&
+              !IsIconic(hwnd_);
+  // Any release lasts until the player clicks back into the game.
+  if (!want) {
+    raw_mouse_armed_ = false;
+  }
+  want = want && raw_mouse_armed_;
+  if (want) {
+    // Re-applied on every focus, move and size change: Windows drops the clip
+    // rectangle when another window takes focus.
+    RECT bounds;
+    GetClientRect(hwnd_, &bounds);
+    MapWindowPoints(hwnd_, nullptr, reinterpret_cast<POINT*>(&bounds), 2);
+    if (!raw_mouse_clipped_) {
+      // Park the cursor in the middle, so the first click after capturing
+      // lands inside the game even from the edge of the window.
+      SetCursorPos((bounds.left + bounds.right) / 2,
+                   (bounds.top + bounds.bottom) / 2);
+    }
+    ClipCursor(&bounds);
+    if (!raw_mouse_clipped_) {
+      raw_mouse_clipped_ = true;
+      SetCursor(nullptr);
+    }
+  } else if (raw_mouse_clipped_) {
+    ClipCursor(nullptr);
+    raw_mouse_clipped_ = false;
+    // Put the arrow back now rather than on the next mouse move.
+    SetCursor(LoadCursor(nullptr, IDC_ARROW));
+  }
 }
 
 std::unique_ptr<ui::MenuItem> MenuItem::Create(Type type,

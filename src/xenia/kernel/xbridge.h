@@ -12,6 +12,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <string>
 
 #include "xenia/base/platform.h"
 #if XE_PLATFORM_WIN32
@@ -34,8 +35,8 @@
 //           token | u32 key tag, all big-endian. flags: bit0 VDP socket,
 //           bit1 control message.
 //   control messages (v2) go over a separate bridge control socket:
-//           up "hello" (proto, title, build, class1..5), down "status" or
-//           "reject" -- see xbridge.cc.
+//           up "hello" (proto, title, build, input, aim_assist, class1..5),
+//           down "status" or "reject" -- see xbridge.cc.
 //
 // Title-specific behaviour (CoD4: stats loader, host-address parser) is in
 // xbridge_titles.cc, keyed by title ID; the rest is title-independent.
@@ -54,13 +55,13 @@ constexpr uint8_t kProtocol = 2;
 // change to the crossplay bridge (xbridge*, the bridge edits in xsocket.cc /
 // xsession.cc / xam_net.cc, their cvars) that goes to players bumps this by
 // one and gets a line in ClassicsConsole0 docs/crossplay/VERSIONING.md.
-constexpr uint32_t kCrossplayBuild = 1;
+constexpr uint32_t kCrossplayBuild = 5;
 
 // Oldest relay (xbridge/versions.py RELAY_BUILD) this build is known to work
 // with. An older relay still gets to try, but the player is told the host's
 // relay is out of date. Raise it when this build needs something new from
 // the relay.
-constexpr uint32_t kMinRelayBuild = 1;
+constexpr uint32_t kMinRelayBuild = 4;  // 4: reads hello input / aim_assist
 constexpr uint8_t kFlagVdp = 1;
 constexpr uint8_t kFlagControl = 2;
 
@@ -86,7 +87,39 @@ void MakeHeader(uint8_t* out, uint16_t guest_port, bool vdp);
 void MapSource(sockaddr* from, uint16_t local_port, const uint8_t* data,
                size_t len);
 
+// A user module finished loading (KernelState::FinishLoadingUserModule),
+// after patch files and before precompilation. In crossplay KBM mode this is
+// where the title's aim assist is removed (hid/crossplay_input.h).
+void OnUserModuleLoaded(uint32_t title_id, uint32_t entry_point,
+                        bool is_title_module);
+
 // ---- title hooks (xbridge_titles.cc) ----
+
+// Crossplay KBM: remove the title's aim assist. The patch is one `blr` over
+// the first instruction of the function that fills the aim-assist target
+// list (AimAssist_AddToTargetList): the list is rebuilt empty every frame, so
+// slowdown, ADS auto-aim, lock-on and melee lunge all find no target -- the
+// same end state as the host plugin's KBM mode, which empties the list around
+// AimAssist_UpdateGamePadInput. `expect` is the build check: the words that
+// must be at `address`, `address + 4`, ... before the patch -- the prologue
+// through the function's own load of screenTargetCount, so a different build
+// or executable (e.g. the single-player xex) is never touched. 0 = don't care
+// (a relative `bl`); expect[0] must be the prologue's `mflr r12`.
+struct AimAssistPatch {
+  uint32_t address;
+  uint32_t expect[8];
+};
+
+// The host's Live private-match lobby, as the relay reports it (status
+// party_* fields, relay build 5+): the XSESSION_INFO an Xbox invite to that
+// lobby carries, plus the playlist version a joiner must match.
+struct PartyInvite {
+  uint8_t xnkid[8];
+  uint8_t xnaddr[36];  // host XNADDR, as stored in guest memory
+  uint8_t xnkey[16];
+  uint32_t playlist_version;
+};
+
 struct TitleHooks {
   uint32_t title_id;
   const char* name;
@@ -96,6 +129,32 @@ struct TitleHooks {
   // The host's own address (network order) from a relay-sourced datagram,
   // or 0. Null = the generic IW infoResponse "\xnaddr\" parser.
   uint32_t (*host_address)(const uint8_t* data, size_t len);
+  // Null = keyboard and mouse can't be used in this title.
+  const AimAssistPatch* aim_assist;
+  // Called every few seconds from the control-channel thread while the
+  // bridge is enabled and this title runs (MW2: offline-profile unlock).
+  void (*on_tick)();
+  // Match-end rejoin (relay status rejoin=<n>, relay build 5+). When the
+  // host's match ends its server shuts down and every remote is dropped;
+  // the host's party members are sent to the next match by the party, a
+  // bridged player is not. Both null = no automatic rejoin in this title.
+  //   client_disconnected: the guest has no server connection (menus).
+  //   run_command: queue a console command in the guest; false if this
+  //   executable isn't the build the hook was written for.
+  bool (*client_disconnected)();
+  bool (*run_command)(const std::string& text);
+  // Party join (bridge_fake_live): the guest is in the host's lobby party /
+  // make the guest accept an invite to it (the title's own accept path).
+  // Both null = no party join in this title.
+  bool (*in_party)();
+  bool (*join_party)(const PartyInvite& invite);
+  // The guest is starting a connect to the host (OOB getchallenge): make its
+  // state match an ordinary System Link joiner unless it is a member of the
+  // host's party (MW2: onlinegame 0, or it loads the constant configstrings
+  // and the host's System Link gamestate is refused). Null = nothing to do.
+  // host_party_members: the host's lobby party gamertags from the relay
+  // (status party_members), "" when unknown.
+  void (*prepare_connect)(const std::string& host_party_members);
 };
 
 const TitleHooks* FindTitle(uint32_t title_id);

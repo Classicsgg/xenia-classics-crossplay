@@ -57,7 +57,9 @@ bool UserProfile::IsSignedInToLive() const {
 }
 
 X_USER_SIGNIN_STATE UserProfile::signin_state() const {
-  return IsLiveEnabled() && cvars::network_mode == NETWORK_MODE::XBOXLIVE
+  // Crossplay fake Live: signed in to Live while staying in System Link mode.
+  return IsLiveEnabled() && (cvars::network_mode == NETWORK_MODE::XBOXLIVE ||
+                             XLiveAPI::BridgeFakeLive())
              ? X_USER_SIGNIN_STATE::SignedInToLive
              : X_USER_SIGNIN_STATE::SignedInLocally;
 }

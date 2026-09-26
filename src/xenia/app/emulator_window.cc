@@ -32,10 +32,12 @@
 #include "xenia/base/system.h"
 #include "xenia/base/threading.h"
 #include "xenia/cpu/processor.h"
+#include "xenia/config.h"
 #include "xenia/emulator.h"
 #include "xenia/gpu/command_processor.h"
 #include "xenia/gpu/graphics_system.h"
 #include "xenia/hid/input_system.h"
+#include "xenia/hid/crossplay_input.h"
 #include "xenia/kernel/XLiveAPI.h"
 #include "xenia/kernel/xam/profile_manager.h"
 #include "xenia/kernel/xam/xam_module.h"
@@ -346,6 +348,30 @@ void EmulatorWindow::ShowUpdateAvailableDialog(const std::string& commit,
 
   new xe::ui::HostNotificationWindow(imgui_drawer_.get(), title_text, message,
                                      0, 9);
+}
+
+void EmulatorWindow::SetCrossplayInput(hid::crossplay::Mode mode) {
+  using hid::crossplay::Mode;
+  hid::crossplay::SetPendingMode(mode);
+  config::SaveConfig();
+  const char* name =
+      mode == Mode::kKbm ? "Keyboard and Mouse" : "Controller";
+  std::string message;
+  if (hid::crossplay::GetMode() == Mode::kOff) {
+    message = fmt::format(
+        "Saved: {}. It applies to crossplay games (bridge_enabled) after "
+        "Xenia restarts.",
+        name);
+  } else if (hid::crossplay::GetMode() == mode) {
+    message = fmt::format("{} is already the active crossplay input.", name);
+  } else {
+    message = fmt::format(
+        "Saved: {}. Restart Xenia to switch -- the input mode can't change "
+        "while Xenia is running.",
+        name);
+  }
+  new xe::ui::HostNotificationWindow(imgui_drawer_.get(), "Crossplay input",
+                                     message, 0);
 }
 
 void EmulatorWindow::EmulatorWindowListener::OnClosing(ui::UIEvent& e) {
@@ -993,6 +1019,34 @@ bool EmulatorWindow::Initialize() {
 
     Netplay_menu->AddChild(MenuItem::Create(MenuItem::Type::kSeparator));
 
+    // Crossplay input (hid/crossplay_input.h). The mode in effect is fixed
+    // at start-up; picking the other one saves it for the next start.
+    {
+      using hid::crossplay::Mode;
+      const Mode active = hid::crossplay::GetMode();
+      auto input_menu =
+          MenuItem::Create(MenuItem::Type::kPopup, "Crossplay &input");
+      auto label = [active](Mode m, const char* name) {
+        std::string text = name;
+        if (active == m) {
+          text += "  (active)";
+        } else if (active == Mode::kOff) {
+          text += "  (crossplay off)";
+        }
+        return text;
+      };
+      input_menu->AddChild(MenuItem::Create(
+          MenuItem::Type::kString, label(Mode::kController, "&Controller"),
+          [this]() { SetCrossplayInput(hid::crossplay::Mode::kController); }));
+      input_menu->AddChild(MenuItem::Create(
+          MenuItem::Type::kString,
+          label(Mode::kKbm, "&Keyboard and Mouse"),
+          [this]() { SetCrossplayInput(hid::crossplay::Mode::kKbm); }));
+      Netplay_menu->AddChild(std::move(input_menu));
+    }
+
+    Netplay_menu->AddChild(MenuItem::Create(MenuItem::Type::kSeparator));
+
     Netplay_menu->AddChild(MenuItem::Create(
         MenuItem::Type::kString, "&Update Checker",
         std::bind(&EmulatorWindow::ToggleUpdaterDialog, this)));
@@ -1173,8 +1227,10 @@ void EmulatorWindow::OnKeyDown(ui::KeyEvent& e) {
     } break;
 
     case ui::VirtualKey::kEscape: {
-      // Allow users to escape fullscreen (but not enter it).
-      if (!window_->IsFullscreen()) {
+      // Allow users to escape fullscreen (but not enter it). Not in crossplay
+      // keyboard-and-mouse mode, where Escape is the game's Start button.
+      if (!window_->IsFullscreen() ||
+          hid::crossplay::GetMode() == hid::crossplay::Mode::kKbm) {
         return;
       }
       SetFullscreen(false);
@@ -1226,7 +1282,10 @@ void EmulatorWindow::OnMouseDown(const ui::MouseEvent& e) {
     return;
   }
 
-  if (e.button() == ui::MouseEvent::Button::kLeft) {
+  // Crossplay KBM: left click is the trigger, a double shot must not toggle
+  // fullscreen.
+  if (e.button() == ui::MouseEvent::Button::kLeft &&
+      hid::crossplay::GetMode() != hid::crossplay::Mode::kKbm) {
     ToggleFullscreenOnDoubleClick();
   }
 }

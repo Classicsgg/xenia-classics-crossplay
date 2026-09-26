@@ -714,7 +714,8 @@ dword_result_t NetDll_XNetGetTitleXnAddr_entry(dword_t caller,
               XNADDR_STATUS::XNADDR_GATEWAY | XNADDR_STATUS::XNADDR_DNS;
   }
 
-  if (cvars::network_mode == NETWORK_MODE::XBOXLIVE) {
+  if (cvars::network_mode == NETWORK_MODE::XBOXLIVE ||
+      XLiveAPI::BridgeFakeLive()) {
     status |= XNADDR_STATUS::XNADDR_ONLINE;
   }
 

@@ -97,6 +97,8 @@ void ImGuiDrawer::AddDialog(ImGuiDialog* dialog) {
     }
   }
   dialogs_.push_back(dialog);
+  // Crossplay KBM: a dialog needs the cursor.
+  window_->SetRawMouseCaptureSuspended(true);
 }
 
 void ImGuiDrawer::RemoveDialog(ImGuiDialog* dialog) {
@@ -113,6 +115,9 @@ void ImGuiDrawer::RemoveDialog(ImGuiDialog* dialog) {
     }
   }
   dialogs_.erase(it);
+  if (dialogs_.empty()) {
+    window_->SetRawMouseCaptureSuspended(false);
+  }
   DetachIfLastWindowRemoved();
 }
 

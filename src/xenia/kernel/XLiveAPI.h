@@ -70,6 +70,8 @@ class XLiveAPI {
   void PrintLibcurlDetails();
 
   static void IpGetConsoleXnAddr(XNADDR* XnAddr_ptr);
+  // Crossplay: bridge_enabled && bridge_fake_live (see XLiveAPI.cpp).
+  static bool BridgeFakeLive();
 
   static void GetXnAddrFromSessionObject(SessionObjectJSON session,
                                          XNADDR* XnAddr_ptr);

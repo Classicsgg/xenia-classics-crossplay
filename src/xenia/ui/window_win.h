@@ -57,6 +57,7 @@ class Win32Window : public Window {
   void ApplyNewCursorVisibility(
       CursorVisibility old_cursor_visibility) override;
   void FocusImpl() override;
+  void ApplyRawMouseSink() override;
 
   std::unique_ptr<Surface> CreateSurfaceImpl(
       Surface::TypeFlags allowed_types) override;
@@ -154,6 +155,15 @@ class Win32Window : public Window {
   bool cursor_currently_auto_hidden_ = false;
 
   HDEVNOTIFY usb_device_notify_ = nullptr;
+
+  // Crossplay KBM (Window::SetRawMouseSink).
+  void RegisterRawMouse();
+  void UpdateRawMouseClip();
+  bool raw_mouse_registered_ = false;
+  bool raw_mouse_clipped_ = false;  // captured: cursor hidden + confined
+  bool raw_mouse_armed_ = false;    // clicked into the game since the last release
+  bool in_menu_loop_ = false;       // menu bar open (Alt)
+  bool in_size_move_ = false;       // title-bar drag / border resize
 };
 
 class Win32MenuItem : public MenuItem {

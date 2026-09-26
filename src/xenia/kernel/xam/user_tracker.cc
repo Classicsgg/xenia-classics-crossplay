@@ -1427,7 +1427,8 @@ uint32_t UserTracker::GetLogonState() const {
   //   return X_ONLINE_E_LOGON_NO_NETWORK_CONNECTION;
   // }
 
-  return network_state == NETWORK_MODE::XBOXLIVE
+  return network_state == NETWORK_MODE::XBOXLIVE ||
+                 XLiveAPI::BridgeFakeLive()  // crossplay fake Live
              ? X_ONLINE_S_LOGON_CONNECTION_ESTABLISHED
              : X_ONLINE_S_LOGON_DISCONNECTED;
 }

@@ -12,6 +12,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <map>
 #include <memory>
 #include <string>
@@ -329,6 +330,35 @@ class Window {
   // necessarily be true immediately.
   void Focus();
 
+  // Crossplay keyboard-and-mouse mode (hid/xbkbm): relative mouse motion from
+  // the OS's raw input -- unaccelerated and not stopped by the cursor reaching
+  // a screen or window edge. `button_flags` are the platform's raw button
+  // transition flags (Windows RI_MOUSE_*), `wheel` is in WHEEL_DELTA units
+  // (positive = away from the user). Set from the UI thread; an empty function
+  // removes the sink. While a sink is set the platform window registers for
+  // raw mouse input and CAPTURES the mouse on a left click in the client area
+  // (click-to-capture, never on focus alone -- so the menu bar and the title
+  // bar stay usable): cursor hidden and confined to the client area, so
+  // turning and clicking can never reach another window. The sink only
+  // receives input while captured. Capture ends -- until the next click in
+  // the game -- on Alt (menu bar), a move or resize, an ImGui dialog opening
+  // (SetRawMouseCaptureSuspended), and focus loss (Alt-Tab).
+  using RawMouseSink = std::function<void(int32_t dx, int32_t dy,
+                                          uint16_t button_flags,
+                                          int16_t wheel)>;
+  void SetRawMouseSink(RawMouseSink sink) {
+    raw_mouse_sink_ = std::move(sink);
+    ApplyRawMouseSink();
+  }
+  // UI thread. The ImGui drawer suspends capture while any dialog is open so
+  // the dialog can be used with the cursor.
+  void SetRawMouseCaptureSuspended(bool suspended) {
+    if (raw_mouse_suspended_ != suspended) {
+      raw_mouse_suspended_ = suspended;
+      ApplyRawMouseSink();
+    }
+  }
+
   // TODO(Triang3l): A resize function, primarily for snapping externally to
   // 1280x720, 1920x1080, and other 1:1 resolutions. It will need to resize the
   // window (to a desired logical size - the actual physical size is entirely
@@ -533,6 +563,10 @@ class Window {
   // nothing otherwise (focus can't be requested before the window is open, a
   // closed window is always assumed to be not in focus).
   virtual void FocusImpl() {}
+  // Called when the raw mouse sink is set or removed.
+  virtual void ApplyRawMouseSink() {}
+  const RawMouseSink& raw_mouse_sink() const { return raw_mouse_sink_; }
+  bool raw_mouse_suspended() const { return raw_mouse_suspended_; }
 
   Presenter* presenter() const { return presenter_; }
   bool HasSurface() const { return presenter_surface_ != nullptr; }
@@ -717,6 +751,9 @@ class Window {
   uint32_t mouse_capture_request_count_ = 0;
 
   CursorVisibility cursor_visibility_ = CursorVisibility::kVisible;
+
+  RawMouseSink raw_mouse_sink_;
+  bool raw_mouse_suspended_ = false;
 
   bool has_focus_ = false;
 

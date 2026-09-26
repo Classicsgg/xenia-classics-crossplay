@@ -46,6 +46,11 @@ class InputDriver {
 
   virtual InputType GetInputType() const = 0;
 
+  // A driver whose state is combined with whichever other driver answers the
+  // slot, instead of competing for it (crossplay KBM: pad in the left hand,
+  // mouse in the right). InputSystem merges it after the normal drivers.
+  virtual bool MergesWithOtherDrivers() const { return false; }
+
  protected:
   explicit InputDriver(xe::ui::Window* window, size_t window_z_order)
       : window_(window), window_z_order_(window_z_order) {}

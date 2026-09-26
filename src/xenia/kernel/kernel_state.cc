@@ -10,6 +10,7 @@
 #include <ranges>
 
 #include "xenia/kernel/kernel_state.h"
+#include "xenia/kernel/xbridge.h"
 
 #include "xenia/base/byte_stream.h"
 #include "xenia/base/logging.h"
@@ -686,6 +687,9 @@ X_RESULT KernelState::FinishLoadingUserModule(
   module->Dump();
   emulator_->patcher()->ApplyPatchesForTitle(memory_, module->title_id(),
                                              module->hash());
+  // Crossplay KBM: remove the title's aim assist before any of it runs.
+  bridge::OnUserModuleLoaded(module->title_id(), module->entry_point(),
+                             !module->is_dll_module());
   emulator_->on_patch_apply();
   if (module->xex_module()) {
     module->xex_module()->Precompile();
