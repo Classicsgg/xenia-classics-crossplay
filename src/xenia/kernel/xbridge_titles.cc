@@ -280,6 +280,26 @@ bool RunGuestCbuf(uint32_t cbuf_add_text, const uint32_t (&expect)[8],
   return true;  // the thread owns itself until it exits
 }
 
+// ---- CoD4: console commands (host-pushed controller layout) ----
+// TU4 Cbuf_AddText 0x82239FD0 (retail IDB 2026-10-02; the CoD4 plugin hooks
+// the same address on a 360): RtlEnterCriticalSection on the command buffer,
+// then appends. Used for the Bumper Jumper bind lines (cc_layout).
+constexpr uint32_t kCod4CbufAddText = 0x82239FD0;
+constexpr uint32_t kCod4CbufExpect[8] = {
+    0x7D8802A6,  // mflr r12
+    0,           // bl __savegprlr_29
+    0x9421FF90,  // stwu r1, -0x70(r1)
+    0x3D6084BC,  // lis r11, cmd buffer @ha
+    0x7C7E1B78,  // mr r30, r3
+    0x3BAB13A0,  // addi r29, r11, @l
+    0x7C9F2378,  // mr r31, r4
+    0x387D02D8,  // addi r3, r29, 0x2D8 (critical section)
+};
+
+bool Cod4RunCommand(const std::string& text) {
+  return RunGuestCbuf(kCod4CbufAddText, kCod4CbufExpect, text);
+}
+
 // ---- MW2: match-end rejoin -------------------------------------------------
 // TU9 (resolved 2026-09-25 from the Alpha 482 rosetta):
 //   Cbuf_AddText 0x82224990 (Sys_EnterCriticalSection(28) / cmd_textArray
@@ -475,8 +495,13 @@ void Mw2PrepareConnect(const std::string& host_party_members) {
     }
     pos = comma + 1;
   }
-  if (listed && Mw2InParty()) {
-    XELOGI("Bridge: connect as the host's party member ({})", me);
+  // A member of the host's party connects as one (the "go" connect). The
+  // relay's member list can lag a fresh join by seconds -- a party late join
+  // connects right away -- so the guest's own membership decides; the list
+  // is only logged.
+  if (Mw2InParty()) {
+    XELOGI("Bridge: connect as the host's party member ({}{})", me,
+           listed ? "" : ", not in the relay's list yet");
     return;
   }
   constexpr uint32_t kOnlinegame = 0x825E21C4;  // dvar_t*, value +8
@@ -536,11 +561,24 @@ bool Mw2JoinParty(const PartyInvite& invite) {
   return true;
 }
 
+bool Mw2SystemLinkMode() {
+  constexpr uint32_t kSystemlink = 0x825E21B0;  // dvar_t*, value +8
+  Memory* memory = kernel_state()->memory();
+  if (!memory->LookupHeap(kSystemlink)) {
+    return false;
+  }
+  const uint32_t dvar =
+      uint32_t(*memory->TranslateVirtual<xe::be<uint32_t>*>(kSystemlink));
+  return dvar && memory->LookupHeap(dvar) &&
+         *memory->TranslateVirtual<uint8_t*>(dvar + 8) != 0;
+}
+
 const TitleHooks kTitles[] = {
-    {0x415607E6, "Call of Duty 4", Cod4OnConnect, nullptr, &kCod4AimAssist},
+    {0x415607E6, "Call of Duty 4", Cod4OnConnect, nullptr, &kCod4AimAssist,
+     nullptr, nullptr, Cod4RunCommand},
     {0x41560817, "Modern Warfare 2", nullptr, nullptr, &kMw2AimAssist,
      Mw2OnTick, Mw2ClientDisconnected, Mw2RunCommand, Mw2InParty,
-     Mw2JoinParty, Mw2PrepareConnect},
+     Mw2JoinParty, Mw2PrepareConnect, Mw2SystemLinkMode},
 };
 
 }  // namespace
@@ -552,6 +590,12 @@ const TitleHooks* FindTitle(uint32_t title_id) {
     }
   }
   return nullptr;
+}
+
+bool RunTitleCommand(const std::string& text) {
+  const TitleHooks* title =
+      FindTitle(kernel_state() ? kernel_state()->title_id() : 0);
+  return title && title->run_command && title->run_command(text);
 }
 
 }  // namespace bridge

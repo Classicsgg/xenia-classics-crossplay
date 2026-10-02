@@ -566,7 +566,13 @@ int XSocket::PollWSASendTo(bool wait, WSASendToData send_async_data,
 
   uint8_t bridge_header[bridge::kHeaderSize];
   bool bridged = false;
-  if (proto_ == X_IPPROTO_UDP) {
+  // Taken over by the crossplay bridge (bridge::ConsumeGuestSend): reported
+  // as sent, never sent.
+  const bool consumed =
+      proto_ == X_IPPROTO_UDP && send_async_data.num_buffers != 0 &&
+      bridge::ConsumeGuestSend(
+          reinterpret_cast<const uint8_t*>(buffers[0].buf), buffers[0].len);
+  if (!consumed && proto_ == X_IPPROTO_UDP) {
     const bool has_data = send_async_data.num_buffers != 0;
     bridged = bridge::OnGuestSend(
         &saddr,
@@ -580,9 +586,16 @@ int XSocket::PollWSASendTo(bool wait, WSASendToData send_async_data,
                           reinterpret_cast<CHAR*>(bridge_header)});
   }
 
-  const int result = ::WSASendTo(
-      native_handle_, buffers.data(), DWORD(buffers.size()), &bytes_sent, 0,
-      &saddr, send_async_data.to_len, nullptr, nullptr);
+  if (consumed) {
+    for (const WSABUF& b : buffers) {
+      bytes_sent += b.len;
+    }
+  }
+  const int result =
+      consumed ? 0
+               : ::WSASendTo(native_handle_, buffers.data(),
+                             DWORD(buffers.size()), &bytes_sent, 0, &saddr,
+                             send_async_data.to_len, nullptr, nullptr);
 
   // The title sent its own buffers; the header is ours.
   if (bridged && bytes_sent >= bridge::kHeaderSize) {
@@ -1286,6 +1299,10 @@ int XSocket::SendTo(uint8_t* buf, uint32_t buf_len, uint32_t flags,
   }
 
   bool bridged = false;
+  if (to && proto_ == X_IPPROTO_UDP &&
+      bridge::ConsumeGuestSend(buf, buf_len)) {
+    return int(buf_len);  // taken over by the crossplay bridge, never sent
+  }
   if (to && proto_ == X_IPPROTO_UDP) {
     bridged = bridge::OnGuestSend(&addr, buf, buf_len);
   }

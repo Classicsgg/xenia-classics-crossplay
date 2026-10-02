@@ -55,7 +55,7 @@ constexpr uint8_t kProtocol = 2;
 // change to the crossplay bridge (xbridge*, the bridge edits in xsocket.cc /
 // xsession.cc / xam_net.cc, their cvars) that goes to players bumps this by
 // one and gets a line in ClassicsConsole0 docs/crossplay/VERSIONING.md.
-constexpr uint32_t kCrossplayBuild = 5;
+constexpr uint32_t kCrossplayBuild = 7;
 
 // Oldest relay (xbridge/versions.py RELAY_BUILD) this build is known to work
 // with. An older relay still gets to try, but the player is told the host's
@@ -70,6 +70,13 @@ constexpr uint8_t kFlagControl = 2;
 // send hooks. Returns true when the datagram now goes to the relay and needs
 // MakeHeader() in front of it.
 bool OnGuestSend(sockaddr* to, const uint8_t* data, size_t len);
+
+// Called first for every outgoing guest UDP datagram. True = the bridge takes
+// this datagram over and it must NOT be sent (the socket reports it sent).
+// Used for Join Game on a host that runs a Live party: the System Link
+// connect never reaches the host, so no stray server client is created that
+// would later collide with the player's party slot (see xbridge.cc).
+bool ConsumeGuestSend(const uint8_t* data, size_t len);
 
 // Title launch (Emulator, right after XLiveAPI::Init): start the control
 // channel so the relay pre-flight -- "relay connected, open System Link" or
@@ -155,9 +162,19 @@ struct TitleHooks {
   // host_party_members: the host's lobby party gamertags from the relay
   // (status party_members), "" when unknown.
   void (*prepare_connect)(const std::string& host_party_members);
+  // The game is in System Link mode (its server list, where Join Game is).
+  // A connect started anywhere else -- the party's "go" connect runs with
+  // System Link off -- is never taken for a Join Game. Null = always.
+  bool (*system_link_mode)();
 };
 
 const TitleHooks* FindTitle(uint32_t title_id);
+
+// Queues a console command in the running title (its own Cbuf_AddText, on a
+// short-lived guest thread). False when the title has no command hook or the
+// running executable is not the build it was written for. Used by the
+// crossplay client settings (hid/crossplay_client.cc).
+bool RunTitleCommand(const std::string& text);
 uint32_t ParseIwInfoResponseXnaddr(const uint8_t* data, size_t len);
 
 }  // namespace bridge

@@ -474,6 +474,11 @@ class ControlChannel {
       party_.playlist_version =
           uint32_t(std::strtoul(get("party_plv").c_str(), nullptr, 10));
     }
+    party_seen_ms_.store(
+        party_valid_ ? std::chrono::duration_cast<std::chrono::milliseconds>(
+                           std::chrono::steady_clock::now().time_since_epoch())
+                           .count()
+                     : 0);
 
     const std::string host = get("host");
     const bool host_up = host == "up";
@@ -638,12 +643,15 @@ class ControlChannel {
   // ---- party join (bridge_fake_live) ----
   // The host's Live private-match lobby shows in the System Link list (the
   // relay answers getinfo for it while no server runs). When the player
-  // picks it and hits Join Game, the game starts an ordinary System Link
-  // connect; that attempt (OnConnectAttempt, from the send path) is turned
-  // into joining the host's party the way a 360 accepts an invite, and the
-  // host then sends this player the same "go" as its Live party members.
-  //   1. a fresh relay status must still describe a lobby -- if the host is
-  //      running a match, it's a normal System Link join and is left alone
+  // picks it -- or the host's running match -- and hits Join Game, the game
+  // starts an ordinary System Link connect; that attempt (OnConnectAttempt,
+  // from the send path) is turned into joining the host's party the way a
+  // 360 accepts an invite. In the lobby the player then gets the same "go"
+  // as the Live party members; in a running match the host sends "go" at
+  // once (party late join). Either way the player stays in the party and
+  // goes back to the lobby with everyone at match end.
+  //   1. a fresh relay status must still describe the host's Live party --
+  //      a System Link host has none: normal System Link join
   //   2. "disconnect" (abandon the System Link connect), systemlink 0
   //      (party code doesn't run in System Link), xblive_playEvenIfDown 1
   //   3. once the guest is back in its menus: the title's join_party
@@ -651,6 +659,29 @@ class ControlChannel {
   static constexpr auto kDisconnectWait = 10s;
 
  public:
+  // Send thread: the host ran a Live party at the last status (<= 15 s ago).
+  bool HostHasParty() const {
+    const int64_t seen = party_seen_ms_.load();
+    const int64_t now = std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::steady_clock::now().time_since_epoch())
+                            .count();
+    return seen && now - seen < 15000;
+  }
+
+  // Join Game already known to be for the host's party (ConsumeGuestSend):
+  // no fresh status needed.
+  void OnJoinGameForParty() {
+    if (!XLiveAPI::BridgeFakeLive() || join_requested_.exchange(true)) {
+      return;
+    }
+    join_confirmed_ = true;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      join_request_time_ = std::chrono::steady_clock::now();
+    }
+    HelloNow();
+  }
+
   std::string HostPartyMembers() {
     std::lock_guard<std::mutex> lock(mutex_);
     return host_party_members_;
@@ -701,13 +732,14 @@ class ControlChannel {
           std::lock_guard<std::mutex> lock(mutex_);
           asked = join_request_time_;
         }
-        if (last_reply_ <= asked) {
+        if (!join_confirmed_ && last_reply_ <= asked) {
           HelloNow();
           return;  // wait for the status that answers the fresh hello
         }
         join_requested_ = false;
+        join_confirmed_ = false;
         if (!party_valid_) {
-          return;  // the host runs a match: a normal System Link join
+          return;  // the host has no Live party (System Link): normal join
         }
         uint32_t ina = 0;
         std::memcpy(&ina, party_.xnaddr, 4);  // network order, as stored
@@ -918,6 +950,8 @@ class ControlChannel {
   int party_stage_ = 0;  // 0 idle, 1 disconnecting, 2 invite written
   std::chrono::steady_clock::time_point party_stage_time_{};
   std::atomic<bool> join_requested_{false};
+  std::atomic<bool> join_confirmed_{false};
+  std::atomic<int64_t> party_seen_ms_{0};  // last status with a host party
   std::string host_party_members_;  // mutex_
   std::chrono::steady_clock::time_point join_request_time_{};  // mutex_
 };
@@ -969,6 +1003,31 @@ void StartControl() {
   control.HelloNow();
 }
 
+bool ConsumeGuestSend(const uint8_t* data, size_t len) {
+  // Join Game in the System Link list on a host that runs a Live party: the
+  // player joins through the party, never through this System Link connect.
+  // Console 2026-09-26: letting the getchallenge/connect through created a
+  // System Link server client under the player's OFFLINE xuid; the party
+  // join then gave the same player a slot under its online xuid, and the
+  // host's "New XUID claiming client num" path tore one or the other down
+  // (join, back to the lobby, join -- or "Game lobby closed").
+  if (!IsOobGetchallenge(data, len) || !XLiveAPI::BridgeFakeLive() ||
+      !GetConfig().enabled) {
+    return false;
+  }
+  const TitleHooks* title = CurrentTitle();
+  if (!title || !title->system_link_mode || !title->system_link_mode() ||
+      !title->in_party || title->in_party()) {
+    return false;
+  }
+  ControlChannel& control = ControlChannel::Get();
+  if (!control.HostHasParty()) {
+    return false;  // no Live party at the host: ordinary System Link join
+  }
+  control.OnJoinGameForParty();
+  return true;
+}
+
 bool OnGuestSend(sockaddr* to, const uint8_t* data, size_t len) {
   if (!RedirectToRelay(to)) {
     return false;
@@ -982,7 +1041,14 @@ bool OnGuestSend(sockaddr* to, const uint8_t* data, size_t len) {
     }
   }
   if (IsOobGetchallenge(data, len) || IsOobConnect(data, len)) {
-    control.OnConnectAttempt();  // Join Game on the host's private lobby?
+    // Join Game in the System Link list? (Not the party's "go" connect:
+    // console 2026-09-26, taking that for a second Join Game ran the party
+    // join again mid-connect -- join, back to the lobby, join again -- and
+    // left the player to time out of the party at the next match end.)
+    const TitleHooks* title = CurrentTitle();
+    if (!title || !title->system_link_mode || title->system_link_mode()) {
+      control.OnConnectAttempt();
+    }
   }
   if (IsOobConnect(data, len)) {
     if (const TitleHooks* title = CurrentTitle(); title && title->on_connect) {

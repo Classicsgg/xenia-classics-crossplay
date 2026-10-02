@@ -15,6 +15,7 @@
 #include <cstdlib>
 
 #include "xenia/base/profiling.h"
+#include "xenia/hid/crossplay_client.h"
 #include "xenia/hid/hid_flags.h"
 #include "xenia/hid/input_driver.h"
 #include "xenia/kernel/util/shim_utils.h"
@@ -133,6 +134,12 @@ X_RESULT InputSystem::GetState(uint32_t user_index, uint32_t flags,
       answered = driver;
       break;
     }
+  }
+  // Crossplay: the host's per-player settings (hid/crossplay_client.h). The
+  // flip is the real pad's, applied before keyboard and mouse is merged in.
+  crossplay::OnGuestPadPoll();
+  if (answered) {
+    crossplay::ApplyHostFlip(&out_state->gamepad);
   }
   // Crossplay KBM: combine with the pad rather than compete for the slot.
   for (auto& driver : filtered_drivers) {
