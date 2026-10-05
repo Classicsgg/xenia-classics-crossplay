@@ -89,7 +89,7 @@ DEFINE_bool(bridge_fake_live, false,
             "Live");
 
 DEFINE_string(bridge_peer_ip, "",
-              "IP the 360 host advertises (its XNADDR ina) e.g. 192.168.86.26",
+              "IP the 360 host advertises (its XNADDR ina) e.g. 192.168.1.50",
               "Live");
 
 // Discord link (crossplay build 8): set by Xenia itself, never by hand.
