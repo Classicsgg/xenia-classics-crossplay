@@ -32,6 +32,7 @@
 #include "xenia/kernel/XLiveAPI.h"
 #include "xenia/kernel/kernel_state.h"
 #include "xenia/kernel/util/shim_utils.h"
+#include "xenia/ui/imgui_dialog.h"
 #include "xenia/ui/imgui_host_notification.h"
 #include "xenia/ui/window.h"
 #include "xenia/ui/windowed_app_context.h"
@@ -48,6 +49,9 @@ DECLARE_string(bridge_address);
 DECLARE_string(bridge_peer_ip);
 DECLARE_string(bridge_key);
 DECLARE_string(bridge_class_names);
+DECLARE_string(bridge_install_id);
+DECLARE_string(bridge_token);
+DECLARE_string(bridge_link_xuid);
 
 namespace xe {
 namespace kernel {
@@ -277,6 +281,120 @@ void Notify(std::string title, std::string text,
       });
 }
 
+// ---- Discord link prompt ----------------------------------------------------
+// What the link dialog shows. Written by the control thread (relay verbs `link`
+// / `linked`, status link=...), read by the dialog on the UI thread.
+struct LinkPromptState {
+  std::mutex mutex;
+  bool visible = false;
+  bool blocked = false;  // a reason, not a code (no Subscriber role, revoked..)
+  std::string code;
+  std::string text;
+};
+LinkPromptState link_prompt;
+std::atomic<bool> link_dialog_open{false};
+std::atomic<uint64_t> linked_xuid{0};
+
+// Stays up -- never on a timer -- until the relay pushes a link token (or says
+// this install is linked): the player can't play ranked before that. Drawn
+// without mouse/nav input so it never takes clicks meant for the game. The
+// window is recreated whenever the prompt comes back.
+class LinkDialog final : public ui::ImGuiDialog {
+ public:
+  explicit LinkDialog(ui::ImGuiDrawer* drawer) : ui::ImGuiDialog(drawer) {}
+
+ protected:
+  void OnDraw(ImGuiIO& io) override {
+    bool visible, blocked;
+    std::string code, text;
+    {
+      std::lock_guard<std::mutex> lock(link_prompt.mutex);
+      visible = link_prompt.visible;
+      blocked = link_prompt.blocked;
+      code = link_prompt.code;
+      text = link_prompt.text;
+    }
+    if (!visible) {
+      link_dialog_open = false;
+      Close();
+      return;
+    }
+    ImGui::SetNextWindowPos(
+        ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.08f),
+        ImGuiCond_Always, ImVec2(0.5f, 0.0f));
+    ImGui::SetNextWindowBgAlpha(0.92f);
+    if (ImGui::Begin("Classics Ranked: link your Discord", nullptr,
+                     ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoResize |
+                         ImGuiWindowFlags_AlwaysAutoResize |
+                         ImGuiWindowFlags_NoSavedSettings |
+                         ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoInputs)) {
+      if (!blocked && !code.empty()) {
+        ImGui::TextUnformatted("In the Classics Discord, type:");
+        ImGui::SetWindowFontScale(2.0f);
+        ImGui::Text("/link %s", code.c_str());
+        ImGui::SetWindowFontScale(1.0f);
+        ImGui::TextUnformatted(
+            "This message closes by itself once you're linked.\n"
+            "PC ranked needs the Subscriber role.");
+      } else if (blocked) {
+        ImGui::TextUnformatted(
+            "You can't play Classics Ranked from this PC yet:");
+        ImGui::TextWrapped("%s", text.c_str());
+      } else {
+        ImGui::TextUnformatted(text.c_str());
+      }
+    }
+    ImGui::End();
+  }
+};
+
+void ShowLinkDialog() {
+  Emulator* emulator = kernel_state() ? kernel_state()->emulator() : nullptr;
+  if (!emulator || !emulator->display_window() || !emulator->imgui_drawer() ||
+      link_dialog_open.exchange(true)) {
+    return;
+  }
+  emulator->display_window()->app_context().CallInUIThread([emulator]() {
+    new LinkDialog(emulator->imgui_drawer());  // deletes itself on Close()
+  });
+}
+
+void SetLinkPrompt(bool visible, bool blocked, std::string code,
+                   std::string text) {
+  {
+    std::lock_guard<std::mutex> lock(link_prompt.mutex);
+    if (link_prompt.visible == visible && link_prompt.blocked == blocked &&
+        link_prompt.code == code && link_prompt.text == text) {
+      return;
+    }
+    link_prompt.visible = visible;
+    link_prompt.blocked = blocked;
+    link_prompt.code = std::move(code);
+    link_prompt.text = std::move(text);
+  }
+  if (visible) {
+    ShowLinkDialog();
+  }
+}
+
+uint64_t ParseHexXuid(const std::string& hex) {
+  return hex.empty() ? 0 : uint64_t(std::strtoull(hex.c_str(), nullptr, 16));
+}
+
+// Saved on the UI thread like the other runtime config changes
+// (EmulatorWindow::SetCrossplayInput): the whole .toml is rewritten.
+void SaveLinkConfig(std::string install_id, std::string token,
+                    std::string xuid_hex) {
+  Emulator* emulator = kernel_state() ? kernel_state()->emulator() : nullptr;
+  if (!emulator || !emulator->display_window()) {
+    return;
+  }
+  emulator->display_window()->app_context().CallInUIThread(
+      [install_id, token, xuid_hex]() {
+        XLiveAPI::SaveBridgeLink(install_id, token, xuid_hex);
+      });
+}
+
 // ---- control channel ------------------------------------------------------
 // A socket of our own (never the guest's), so control traffic never mixes
 // with game datagrams in either direction. It says hello to the relay at
@@ -286,10 +404,14 @@ void Notify(std::string title, std::string text,
 // are logged; the ones a player must act on also show as an on-screen
 // notification.
 //
-//   hello   proto, title (hex), build, class1..class5 (bridge_class_names)
+//   hello   proto, title (hex), build, class1..class5 (bridge_class_names),
+//           install, [token] (Discord link)
 //   status  proto, host (up|down), title, players, max, [peer],
-//           [rejoin_wait=1 | rejoin=<match no>] (see MaybeRejoin)
+//           [rejoin_wait=1 | rejoin=<match no>] (see MaybeRejoin),
+//           [link=ok|required|blocked|checking] (relay build 13+)
 //   reject  proto, reason (key|title|full|version), text
+//   link    code + text, or blocked=1 + text: the Discord link prompt
+//   linked  token, xuid (hex): save both, close the prompt
 class ControlChannel {
  public:
   static ControlChannel& Get() {
@@ -298,7 +420,15 @@ class ControlChannel {
   }
 
   void EnsureRunning() {
-    std::call_once(started_, [this] { std::thread([this] { Run(); }).detach(); });
+    std::call_once(started_, [this] {
+      LoadLinkIdentity();
+      std::thread([this] { Run(); }).detach();
+    });
+  }
+
+  bool HasLinkToken() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return !link_token_.empty();
   }
 
   void HelloNow() {
@@ -357,7 +487,92 @@ class ControlChannel {
       }
       start = comma + 1;
     }
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      body += "\ninstall=" + install_id_;
+      if (!link_token_.empty()) {
+        body += "\ntoken=" + link_token_;
+      }
+    }
     return body;
+  }
+
+  // bridge_install_id / bridge_token / bridge_link_xuid, read once at start-up
+  // (afterwards the UI thread may rewrite the cvars; we keep our own copies).
+  void LoadLinkIdentity() {
+    std::string install = cvars::bridge_install_id;
+    std::string token = cvars::bridge_token;
+    std::string xuid_hex = cvars::bridge_link_xuid;
+    if (install.size() < 16) {
+      static const char kAlphabet[] =
+          "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+      std::random_device rd;
+      install.clear();
+      for (int i = 0; i < 32; i++) {
+        install += kAlphabet[rd() % (sizeof(kAlphabet) - 1)];
+      }
+      XELOGI("Bridge: new crossplay install id for the Discord link");
+      SaveLinkConfig(install, token, xuid_hex);
+    }
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      install_id_ = install;
+      link_token_ = token;
+      link_xuid_hex_ = xuid_hex;
+    }
+    linked_xuid = token.empty() ? 0 : ParseHexXuid(xuid_hex);
+  }
+
+  // Relay verbs `link` / `linked` (relay build 13+).
+  void HandleLink(const std::string& verb,
+                  const std::map<std::string, std::string>& f) {
+    auto get = [&f](const char* k) {
+      auto it = f.find(k);
+      return it == f.end() ? std::string() : it->second;
+    };
+    if (verb == "link") {
+      const bool blocked = get("blocked") == "1";
+      if (blocked) {
+        if (get("text") != last_link_text_) {
+          last_link_text_ = get("text");
+          XELOGW("Bridge: Discord link: {}", last_link_text_);
+        }
+      } else if (get("code") != last_code_) {
+        last_code_ = get("code");
+        XELOGI("Bridge: Discord link code {} (type /link {} in Discord)",
+               last_code_, last_code_);
+      }
+      SetLinkPrompt(true, blocked, blocked ? "" : get("code"), get("text"));
+      return;
+    }
+    // linked: a new or renewed token (and the XUID it assigns)
+    const std::string token = get("token");
+    const std::string xuid_hex = get("xuid");
+    if (token.empty() || xuid_hex.empty()) {
+      return;
+    }
+    std::string install;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      if (token == link_token_ && xuid_hex == link_xuid_hex_) {
+        return;
+      }
+      link_token_ = token;
+      link_xuid_hex_ = xuid_hex;
+      install = install_id_;
+    }
+    const uint64_t xuid = ParseHexXuid(xuid_hex);
+    const uint64_t before = linked_xuid.exchange(xuid);
+    SaveLinkConfig(install, token, xuid_hex);
+    SetLinkPrompt(false, false, "", "");
+    XELOGI("Bridge: Discord link saved; ranked XUID {}", xuid_hex);
+    if (before != xuid) {
+      const bool in_title = kernel_state() && kernel_state()->title_id();
+      Notify("Classics Ranked: Discord linked",
+             in_title ? "Linked. Restart the game so it plays under your "
+                        "linked identity."
+                      : "Linked. You're ready for ranked.");
+    }
   }
 
   static std::map<std::string, std::string> Parse(std::string_view text,
@@ -403,6 +618,10 @@ class ControlChannel {
       return it == f.end() ? std::string() : it->second;
     };
 
+    if (verb == "link" || verb == "linked") {
+      HandleLink(verb, f);
+      return;
+    }
     if (verb == "reject") {
       const std::string state = "reject:" + get("reason");
       if (state != state_) {
@@ -418,6 +637,11 @@ class ControlChannel {
     }
     if (verb != "status") {
       return;
+    }
+    // link=ok: this install is linked -> no prompt. No link field at all: a
+    // relay older than build 13 (no Discord link) -> no prompt either.
+    if (get("link") == "ok" || !f.count("link")) {
+      SetLinkPrompt(false, false, "", "");
     }
 
     // Version contract, the other direction: warn once if the host's relay
@@ -938,6 +1162,11 @@ class ControlChannel {
   std::string state_;    // "", "up", "down", "silent", "reject:<reason>"
   std::string summary_;
   bool warned_relay_ = false;
+  std::string install_id_;     // mutex_
+  std::string link_token_;     // mutex_
+  std::string link_xuid_hex_;  // mutex_
+  std::string last_code_;
+  std::string last_link_text_;
   std::chrono::steady_clock::time_point last_reply_{};
   uint32_t rejoin_pending_ = 0;  // relay's match number still to rejoin
   uint32_t rejoin_done_ = 0;     // last one handled (joined or given up)
@@ -991,6 +1220,22 @@ void LearnPeer(const uint8_t* data, size_t len) {
 }  // namespace
 
 bool RedirectSend(sockaddr* to) { return RedirectToRelay(to); }
+
+void StartAtLaunch() {
+  if (!GetConfig().enabled) {
+    return;
+  }
+  ControlChannel& control = ControlChannel::Get();
+  control.EnsureRunning();  // loads the link identity first
+  if (!control.HasLinkToken()) {
+    SetLinkPrompt(true, false, "",
+                  "Classics Ranked: getting your Discord link code from the "
+                  "relay...");
+  }
+  control.HelloNow();
+}
+
+uint64_t LinkedXuid() { return linked_xuid.load(); }
 
 void StartControl() {
   if (!GetConfig().enabled) {

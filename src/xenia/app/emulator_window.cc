@@ -42,6 +42,7 @@
 #include "xenia/kernel/xam/profile_manager.h"
 #include "xenia/kernel/xam/xam_module.h"
 #include "xenia/kernel/xam/xam_state.h"
+#include "xenia/kernel/xbridge.h"
 #include "xenia/kernel/xconfig.h"
 #include "xenia/ui/file_picker.h"
 #include "xenia/ui/graphics_provider.h"
@@ -281,6 +282,10 @@ void EmulatorWindow::ShutdownGraphicsSystemPresenterPainting() {
 }
 
 void EmulatorWindow::OnEmulatorInitialized() {
+  // Crossplay: talk to the relay from start-up (not only at title launch) so
+  // an install without a Discord link shows its /link code right away.
+  kernel::bridge::StartAtLaunch();
+
   if (!emulator_->kernel_state()
            ->xam_state()
            ->profile_manager()

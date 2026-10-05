@@ -21,6 +21,7 @@
 #include "xenia/base/string_util.h"
 #include "xenia/emulator.h"
 #include "xenia/kernel/XLiveAPI.h"
+#include "xenia/config.h"
 #include "xenia/kernel/user_module.h"
 #include "xenia/kernel/util/friends_util.h"
 #include "xenia/kernel/util/shim_utils.h"
@@ -89,6 +90,22 @@ DEFINE_bool(bridge_fake_live, false,
 
 DEFINE_string(bridge_peer_ip, "",
               "IP the 360 host advertises (its XNADDR ina) e.g. 192.168.86.26",
+              "Live");
+
+// Discord link (crossplay build 8): set by Xenia itself, never by hand.
+DEFINE_string(bridge_install_id, "",
+              "Crossplay: this install's id for the Discord link. Generated "
+              "once; keep it private (it collects your link token).",
+              "Live");
+
+DEFINE_string(bridge_token, "",
+              "Crossplay: Discord link token from the relay, saved after "
+              "/link in Discord. Delete it to link again.",
+              "Live");
+
+DEFINE_string(bridge_link_xuid, "",
+              "Crossplay: the XUID your Discord link assigned (hex, saved with "
+              "the token). With bridge_fake_live the profile plays under it.",
               "Live");
 
 DEFINE_bool(xstorage_backend, true,
@@ -508,6 +525,15 @@ void XLiveAPI::clearXnaddrCache() {
 }
 
 // Request data from the server
+void XLiveAPI::SaveBridgeLink(const std::string& install_id,
+                              const std::string& token,
+                              const std::string& xuid_hex) {
+  OVERRIDE_string(bridge_install_id, install_id);
+  OVERRIDE_string(bridge_token, token);
+  OVERRIDE_string(bridge_link_xuid, xuid_hex);
+  config::SaveConfig();
+}
+
 bool XLiveAPI::BridgeFakeLive() {
   return cvars::bridge_enabled && cvars::bridge_fake_live;
 }

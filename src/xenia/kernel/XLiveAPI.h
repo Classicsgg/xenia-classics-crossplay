@@ -72,6 +72,11 @@ class XLiveAPI {
   static void IpGetConsoleXnAddr(XNADDR* XnAddr_ptr);
   // Crossplay: bridge_enabled && bridge_fake_live (see XLiveAPI.cpp).
   static bool BridgeFakeLive();
+  // Crossplay Discord link: store bridge_install_id / bridge_token /
+  // bridge_link_xuid and rewrite the config file. UI thread only.
+  static void SaveBridgeLink(const std::string& install_id,
+                             const std::string& token,
+                             const std::string& xuid_hex);
 
   static void GetXnAddrFromSessionObject(SessionObjectJSON session,
                                          XNADDR* XnAddr_ptr);

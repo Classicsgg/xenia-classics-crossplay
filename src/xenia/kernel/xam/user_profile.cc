@@ -16,6 +16,7 @@
 #include "xenia/kernel/util/presence_string_builder.h"
 #include "xenia/kernel/util/shim_utils.h"
 #include "xenia/kernel/util/xlast.h"
+#include "xenia/kernel/xbridge.h"
 #include "xenia/kernel/xam/xdbf/gpd_info.h"
 
 namespace xe {
@@ -50,6 +51,15 @@ void UserProfile::LoadFriends() {
 
   xam_state->friends_manager()->AddDummyFriends(
       xuid_, kernel_state()->GetXboxLiveAPI()->GetDummyFriendsCount());
+}
+
+uint64_t UserProfile::EffectiveOnlineXuid() const {
+  if (XLiveAPI::BridgeFakeLive()) {
+    if (const uint64_t linked = bridge::LinkedXuid()) {
+      return linked;
+    }
+  }
+  return static_cast<uint64_t>(account_info_.xuid_online);
 }
 
 bool UserProfile::IsSignedInToLive() const {

@@ -114,15 +114,17 @@ class UserProfile {
 
   uint64_t xuid() const { return xuid_; }
   uint64_t GetOnlineXUID() const {
-    return IsLiveEnabled() ? static_cast<uint64_t>(account_info_.xuid_online)
-                           : 0;
+    return IsLiveEnabled() ? EffectiveOnlineXuid() : 0;
   }
   uint64_t GetLogonXUID() const {
     return IsLiveEnabled() &&
                    signin_state() == X_USER_SIGNIN_STATE::SignedInToLive
-               ? static_cast<uint64_t>(account_info_.xuid_online)
+               ? EffectiveOnlineXuid()
                : xuid();
   }
+  // The account's online XUID, or -- crossplay fake Live with a Discord link
+  // (kernel/xbridge.h LinkedXuid) -- the XUID that link assigned.
+  uint64_t EffectiveOnlineXuid() const;
 
   std::string name() const { return account_info_.GetGamertagString(); }
   X_USER_SIGNIN_STATE signin_state() const;

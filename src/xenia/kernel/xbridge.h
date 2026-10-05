@@ -35,8 +35,9 @@
 //           token | u32 key tag, all big-endian. flags: bit0 VDP socket,
 //           bit1 control message.
 //   control messages (v2) go over a separate bridge control socket:
-//           up "hello" (proto, title, build, input, aim_assist, class1..5),
-//           down "status" or "reject" -- see xbridge.cc.
+//           up "hello" (proto, title, build, input, aim_assist, class1..5,
+//           install, [token]), down "status", "reject", "link", "linked" --
+//           see xbridge.cc.
 //
 // Title-specific behaviour (CoD4: stats loader, host-address parser) is in
 // xbridge_titles.cc, keyed by title ID; the rest is title-independent.
@@ -55,7 +56,7 @@ constexpr uint8_t kProtocol = 2;
 // change to the crossplay bridge (xbridge*, the bridge edits in xsocket.cc /
 // xsession.cc / xam_net.cc, their cvars) that goes to players bumps this by
 // one and gets a line in ClassicsConsole0 docs/crossplay/VERSIONING.md.
-constexpr uint32_t kCrossplayBuild = 7;
+constexpr uint32_t kCrossplayBuild = 8;  // 8: Discord link prompt + XUID
 
 // Oldest relay (xbridge/versions.py RELAY_BUILD) this build is known to work
 // with. An older relay still gets to try, but the player is told the host's
@@ -83,6 +84,24 @@ bool ConsumeGuestSend(const uint8_t* data, size_t len);
 // "no answer from relay" -- shows before the player goes looking for a match.
 // No-op unless bridge_enabled.
 void StartControl();
+
+// ---- Discord link (crossplay build 8, relay build 13+) ----
+// Ranked identity = the player's Discord account. Xenia start-up
+// (EmulatorWindow::OnEmulatorInitialized) starts the control channel at once,
+// without a title, and -- while this install holds no link token -- shows a
+// prompt that stays on screen until the relay pushes one: "type /link CODE in
+// Discord". The hello carries install=<bridge_install_id> (generated once) and
+// token=<bridge_token>; the relay answers with control verbs `link` (code +
+// text, or blocked=1 + text) and `linked` (token, xuid), see xbridge.cc. No-op
+// unless bridge_enabled.
+void StartAtLaunch();
+
+// The XUID the player's Discord link assigned (bridge_link_xuid), 0 = none.
+// While bridge_fake_live is on, the profile's online / logon XUID is this
+// (UserProfile::GetOnlineXUID), so every XUID-keyed ranked table follows the
+// Discord account rather than whatever profile is signed in. Takes effect when
+// the title signs in: linking with a game already running needs a restart.
+uint64_t LinkedXuid();
 
 // connect() on a UDP socket: redirect only (no header path for send()).
 bool RedirectSend(sockaddr* to);
