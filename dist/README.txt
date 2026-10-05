@@ -8,7 +8,7 @@ you as a normal player.
 
 Full setup guide:  https://classics.gg/ranked/how-it-works  (PC - Xenia)
 Discord:           https://classics.gg/discord
-Source code:       https://github.com/<you>/xenia-classics-crossplay
+Source code:       https://github.com/Classicsgg/xenia-classics-crossplay
 
 NOT INCLUDED: the games. Use your own Xbox 360 copies, on the same title
 update as the host:
