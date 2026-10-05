@@ -1,3 +1,50 @@
+# Xenia Classics Crossplay
+
+A fork of [Xenia Canary Netplay](https://github.com/AdrianCassar/xenia-canary) that lets PC players join
+**Call of Duty 4** (TU4) and **Modern Warfare 2** (TU9) matches hosted on a **real Xbox 360**, alongside
+Xbox 360 and PS3 players. It powers PC play in [Classics Ranked](https://classics.gg/ranked).
+
+**You need your own copy of the game.** This repository and its releases contain no game files.
+
+## Download and set up
+
+* **Download:** the latest build is on the [Releases](../../releases) page.
+* **Setup guide:** [classics.gg/ranked/how-it-works](https://classics.gg/ranked/how-it-works) (PC · Xenia).
+* **Ranked play** needs the Subscriber role in the [Classics Discord](https://classics.gg/discord). On first
+  start Xenia shows a code; type `/link` with it in the Discord. The message closes once you're linked.
+
+## What this fork adds
+
+All of it is off unless `bridge_enabled` is set in the config (`[Live]` section).
+
+* **Crossplay bridge** (`src/xenia/kernel/xbridge*`): system-link traffic for the 360 host goes through the
+  host's crossplay relay, with a small header in front; replies are presented to the game as the host's.
+  A control channel carries the player's build, input mode and the Discord link.
+* **Discord link** (crossplay build 8): ranked identity is the player's Discord account. The relay assigns
+  the account a fixed XUID, which the profile plays under while `bridge_fake_live` is on.
+* **MW2 Xbox Live private-match party join** through the relay (`bridge_fake_live`), automatic rejoin after
+  a match ends, and an optional offline-profile unlock so custom classes can be built.
+* **Keyboard and mouse** for crossplay (`bridge_input_mode = "kbm"`), which removes the game's aim assist.
+* **Host player settings** (flipped bumpers/triggers, sensitivity compensation, CoD4 Bumper Jumper).
+
+The relay, the host console plugin and the ranked services are not part of this repository.
+
+## Build
+
+Windows, Visual Studio 2022 and the Vulkan SDK; CMake/Ninja:
+
+```
+python xenia-build.py build --config=release
+```
+
+The exe is `build/bin/Windows/Release/xenia_canary_netplay.exe`.
+
+## License
+
+BSD, as upstream Xenia (see [LICENSE](LICENSE)). Everything below is the upstream Xenia Canary Netplay readme.
+
+---
+
 # Xenia Canary Netplay
 
 This is a fork of [Xenia Canary](https://github.com/xenia-canary/xenia-canary) which implements online multiplayer features. The REST API powering this fork can be found [here](https://github.com/AdrianCassar/Xenia-WebServices#xenia-web-services).
