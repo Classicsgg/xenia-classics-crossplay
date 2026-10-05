@@ -4,7 +4,8 @@ A fork of [Xenia Canary Netplay](https://github.com/AdrianCassar/xenia-canary) t
 **Call of Duty 4** (TU4) and **Modern Warfare 2** (TU9) matches hosted on a **real Xbox 360**, alongside
 Xbox 360 and PS3 players. It powers PC play in [Classics Ranked](https://classics.gg/ranked).
 
-**You need your own copy of the game.** This repository and its releases contain no game files.
+**You need your own copy of the game.** The games are not included. The download carries two small
+files the crossplay setup needs: MW2's playlist file and a CoD4 classes file (see `dist/`).
 
 ## Download and set up
 
@@ -35,9 +36,12 @@ Windows, Visual Studio 2022 and the Vulkan SDK; CMake/Ninja:
 
 ```
 python xenia-build.py build --config=release
+python dist/package.py
 ```
 
-The exe is `build/bin/Windows/Release/xenia_canary_netplay.exe`.
+The exe is `build/bin/Windows/Release/xenia_canary_netplay.exe`; `dist/package.py` zips it with the
+config template, bindings, README and support files from `dist/` into
+`build/Xenia-Classics-Crossplay-b<build>.zip` (the release download) and prints its size and SHA-256.
 
 ## License
 
