@@ -10,3 +10,6 @@
 
 src/**/shaders/bytecode/** linguist-generated=true
 src/**/testing/** linguist-detectable=false
+
+# Player package files: stored byte-exact (MW2/CoD4 read them as-is)
+dist/** -text
