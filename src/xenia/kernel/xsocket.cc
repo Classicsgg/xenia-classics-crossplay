@@ -428,8 +428,21 @@ int XSocket::RecvFrom(uint8_t* buf, uint32_t buf_len, uint32_t flags,
     sa = from->to_host();
   }
 
+  // UDP: always ask for the sender -- the crossplay bridge strips its relay
+  // framing (protocol 3) by it, whether or not the title wants the address.
+  socklen_t local_len = sizeof(sa);
+  const bool want_from = from || proto_ == X_IPPROTO_UDP;
   int ret = recvfrom(native_handle_, reinterpret_cast<char*>(buf), buf_len,
-                     flags, from ? &sa : nullptr, from_len);
+                     flags, want_from ? &sa : nullptr,
+                     want_from ? (from_len ? from_len : &local_len) : nullptr);
+
+  if (proto_ == X_IPPROTO_UDP && ret > 0) {
+    const size_t strip = bridge::MapSource(&sa, bound_port_, buf, size_t(ret));
+    if (strip && size_t(ret) >= strip) {
+      ret -= int(strip);
+      std::memmove(buf, buf + strip, size_t(ret));
+    }
+  }
 
   // 555307EE expects port even with TCP, include IP anyway.
   // Verified on console.
@@ -439,9 +452,6 @@ int XSocket::RecvFrom(uint8_t* buf, uint32_t buf_len, uint32_t flags,
   }
 
   if (from) {
-    if (proto_ == X_IPPROTO_UDP && ret > 0) {
-      bridge::MapSource(&sa, bound_port_, buf, size_t(ret));
-    }
     from->to_guest(&sa);
   }
 
@@ -845,7 +855,11 @@ int XSocket::PollWSARecvFrom(bool wait, WSARecvFromData receive_async_data) {
 
   DWORD bytes_received = 0;
   DWORD flags = 0;
-  int from_len = *receive_async_data.from_len;
+  int from_len = receive_async_data.from_len
+                     ? int(*receive_async_data.from_len)
+                     : int(sizeof(saddr));
+  // UDP: always ask for the sender (crossplay framing, see RecvFrom).
+  const bool want_from = receive_async_data.from || proto_ == X_IPPROTO_UDP;
 
   // num_bytes_recv and flags are only updated on immediate completion.
   if (!wait && receive_async_data.flags) {
@@ -854,8 +868,8 @@ int XSocket::PollWSARecvFrom(bool wait, WSARecvFromData receive_async_data) {
 
   const int result = ::WSARecvFrom(
       native_handle_, &recv_buffer, receive_async_data.num_buffers,
-      &bytes_received, &flags, receive_async_data.from ? &saddr : nullptr,
-      receive_async_data.from_len ? &from_len : nullptr, nullptr, nullptr);
+      &bytes_received, &flags, want_from ? &saddr : nullptr,
+      want_from ? &from_len : nullptr, nullptr, nullptr);
 
   const bool pending =
       XWSAGetLastError() ==
@@ -879,16 +893,21 @@ int XSocket::PollWSARecvFrom(bool wait, WSARecvFromData receive_async_data) {
   }
 
   if (result == X_ERROR_SUCCESS) {
+    if (proto_ == X_IPPROTO_UDP) {
+      const size_t strip = bridge::MapSource(
+          &saddr, bound_port_,
+          reinterpret_cast<const uint8_t*>(recv_buffer.buf), bytes_received);
+      if (strip && bytes_received >= strip) {
+        bytes_received -= DWORD(strip);
+        std::memmove(recv_buffer.buf, recv_buffer.buf + strip, bytes_received);
+      }
+    }
     if (receive_async_data.from) {
       // Copy behavior from recvfrom.
       // Verified on console.
       if (proto_ == X_IPPROTO_TCP) {
         socklen_t peer_addar_len = sizeof(sockaddr);
         getpeername(native_handle_, &saddr, &peer_addar_len);
-      } else {
-        bridge::MapSource(
-            &saddr, bound_port_,
-            reinterpret_cast<const uint8_t*>(recv_buffer.buf), bytes_received);
       }
 
       receive_async_data.from->to_guest(&saddr);

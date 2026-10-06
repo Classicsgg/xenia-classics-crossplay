@@ -46,7 +46,9 @@ namespace kernel {
 namespace bridge {
 
 constexpr size_t kHeaderSize = 14;
-constexpr uint8_t kProtocol = 2;
+// 3 (build 9): several hosts behind one relay -- the header's upper flag
+// nibble names the host (kSlotShift), see xbridge.cc HostTable.
+constexpr uint8_t kProtocol = 3;
 
 // ---------------------------------------------------------------------------
 // CROSSPLAY BUILD NUMBER -- BUMP IT WITH EVERY CHANGE THAT SHIPS.
@@ -56,15 +58,17 @@ constexpr uint8_t kProtocol = 2;
 // change to the crossplay bridge (xbridge*, the bridge edits in xsocket.cc /
 // xsession.cc / xam_net.cc, their cvars) that goes to players bumps this by
 // one and gets a line in ClassicsConsole0 docs/crossplay/VERSIONING.md.
-constexpr uint32_t kCrossplayBuild = 8;  // 8: Discord link prompt + XUID
+constexpr uint32_t kCrossplayBuild = 9;  // 9: protocol 3, several RX hosts
 
 // Oldest relay (xbridge/versions.py RELAY_BUILD) this build is known to work
 // with. An older relay still gets to try, but the player is told the host's
 // relay is out of date. Raise it when this build needs something new from
 // the relay.
-constexpr uint32_t kMinRelayBuild = 4;  // 4: reads hello input / aim_assist
+constexpr uint32_t kMinRelayBuild = 17;  // 17: protocol 3 (an older relay drops
+                                         // version-3 datagrams)
 constexpr uint8_t kFlagVdp = 1;
 constexpr uint8_t kFlagControl = 2;
+constexpr int kSlotShift = 4;  // flags >> 4 = host slot (1..15; 0 = home host)
 
 // Outgoing UDP datagram from the guest. Redirects `to` to the relay when it
 // is bound for the 360 host (or the LAN broadcast) and runs the title's
@@ -110,8 +114,11 @@ void MakeHeader(uint8_t* out, uint16_t guest_port, bool vdp);
 
 // Incoming UDP datagram. A datagram from the relay is presented as the 360
 // host answering on `local_port`; host-address learning happens here.
-void MapSource(sockaddr* from, uint16_t local_port, const uint8_t* data,
-               size_t len);
+// Returns how many bytes of relay framing lead the data (protocol 3: the
+// header naming the host it came from) -- the caller drops them before the
+// title sees the datagram; 0 for anything else.
+size_t MapSource(sockaddr* from, uint16_t local_port, const uint8_t* data,
+                 size_t len);
 
 // A user module finished loading (KernelState::FinishLoadingUserModule),
 // after patch files and before precompilation. In crossplay KBM mode this is

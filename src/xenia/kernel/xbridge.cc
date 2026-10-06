@@ -9,6 +9,7 @@
 
 #include "xenia/kernel/xbridge.h"
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -86,6 +87,20 @@ uint32_t KeyTag(const std::string& key) {
 // not learned yet (discovery still works: broadcast getinfo is redirected
 // regardless).
 std::atomic<uint32_t> learned_peer{0};
+
+// Several hosts behind one relay (protocol 3, relay build 17+): each host's
+// game address (its XNADDR ina, network order) by relay slot 1..15, from the
+// relay's status (hosts=<slot>:<ip>,...), and the slot this player was placed
+// on (home=). A datagram the game sends to any of them goes to the relay with
+// that slot in the header, and one coming back is presented as coming from the
+// host whose slot the relay put on it -- so the game can follow a host's own
+// redirect (MW2 newlobbyinfo, the matchmaker hub) to another host. Empty with
+// an older relay: everything is the one host, as before.
+std::array<std::atomic<uint32_t>, 16> host_ina{};
+std::atomic<uint32_t> home_slot{0};
+// The slot RedirectToRelay picked for the datagram this thread is sending;
+// MakeHeader (called right after it on the same thread) writes it.
+thread_local uint8_t t_send_slot = 0;
 
 // bridge_address may be a DNS name (e.g. a dynamic-DNS name for the host's
 // home connection). It is resolved when the config is parsed and then again
@@ -684,6 +699,39 @@ class ControlChannel {
       wait_noted_ = false;
     }
 
+    // Several hosts (relay build 17+): hosts=<slot>:<ip>,... and home=<slot>.
+    // No hosts field (older relay): the table empties -- one host, as before.
+    {
+      std::array<uint32_t, 16> table{};
+      const std::string hosts = get("hosts");
+      size_t pos = 0;
+      while (pos < hosts.size()) {
+        size_t end = hosts.find(',', pos);
+        if (end == std::string::npos) end = hosts.size();
+        const std::string item = hosts.substr(pos, end - pos);
+        const size_t colon = item.find(':');
+        if (colon != std::string::npos) {
+          const unsigned long s = std::strtoul(item.c_str(), nullptr, 10);
+          in_addr a = {};
+          if (s >= 1 && s < table.size() &&
+              inet_pton(AF_INET, item.substr(colon + 1).c_str(), &a) == 1) {
+            table[s] = a.s_addr;
+          }
+        }
+        pos = end + 1;
+      }
+      bool changed = false;
+      for (size_t s = 1; s < table.size(); s++) {
+        changed |= host_ina[s].exchange(table[s]) != table[s];
+      }
+      const uint32_t home =
+          uint32_t(std::strtoul(get("home").c_str(), nullptr, 10));
+      changed |= home_slot.exchange(home) != home;
+      if (changed && !hosts.empty()) {
+        XELOGI("Bridge: relay hosts {} (placed on {})", hosts, home);
+      }
+    }
+
     // Party join (bridge_fake_live): the host is in a Live private-match
     // lobby; its invite details come with every status while it is.
     {
@@ -1191,8 +1239,17 @@ bool RedirectToRelay(sockaddr* to) {
   if (!config.enabled || addr_in->sin_family != AF_INET) {
     return false;
   }
-  if ((config.peer.s_addr && addr_in->sin_addr.s_addr == config.peer.s_addr) ||
+  uint8_t slot = 0;
+  for (uint8_t s = 1; s < host_ina.size() && addr_in->sin_addr.s_addr; s++) {
+    if (host_ina[s].load() == addr_in->sin_addr.s_addr) {
+      slot = s;
+      break;
+    }
+  }
+  if (slot ||
+      (config.peer.s_addr && addr_in->sin_addr.s_addr == config.peer.s_addr) ||
       addr_in->sin_addr.s_addr == INADDR_BROADCAST) {
+    t_send_slot = slot;
     addr_in->sin_addr = config.relay.sin_addr;
     addr_in->sin_port = config.relay.sin_port;
     return true;
@@ -1374,27 +1431,47 @@ void OnUserModuleLoaded(uint32_t title_id, uint32_t entry_point,
 }
 
 void MakeHeader(uint8_t* out, uint16_t guest_port, bool vdp) {
-  WriteHeader(out, guest_port, vdp ? kFlagVdp : 0);
+  WriteHeader(out, guest_port,
+              uint8_t((vdp ? kFlagVdp : 0) | (t_send_slot << kSlotShift)));
 }
 
-void MapSource(sockaddr* from, uint16_t local_port, const uint8_t* data,
-               size_t len) {
+size_t MapSource(sockaddr* from, uint16_t local_port, const uint8_t* data,
+                 size_t len) {
   sockaddr_in* addr_in = reinterpret_cast<sockaddr_in*>(from);
   const Config relay_check = GetConfig();
   if (!relay_check.enabled || addr_in->sin_family != AF_INET ||
       addr_in->sin_addr.s_addr != relay_check.relay.sin_addr.s_addr ||
       addr_in->sin_port != relay_check.relay.sin_port) {
-    return;
+    return 0;
+  }
+  // Protocol 3: the relay puts our header in front of game bytes, its upper
+  // flag nibble = the host they come from. Only with OUR token (a game packet
+  // that merely starts with "XB" is not ours).
+  size_t strip = 0;
+  uint8_t slot = 0;
+  if (data && len >= kHeaderSize && data[0] == 'X' && data[1] == 'B' &&
+      data[2] >= 3 && !(data[3] & kFlagControl)) {
+    const uint32_t token = uint32_t(data[6]) << 24 | uint32_t(data[7]) << 16 |
+                           uint32_t(data[8]) << 8 | data[9];
+    if (token == InstanceToken()) {
+      strip = kHeaderSize;
+      slot = uint8_t(data[3] >> kSlotShift);
+    }
   }
   // Learn first, so even the very first reply is presented as the host.
-  if (data && len) {
-    LearnPeer(data, len);
+  if (data && len > strip) {
+    LearnPeer(data + strip, len - strip);
   }
+  const uint32_t ina = slot ? host_ina[slot].load() : 0;
   const Config config = GetConfig();
-  if (config.peer.s_addr) {
+  if (ina) {
+    addr_in->sin_addr.s_addr = ina;
+    addr_in->sin_port = htons(local_port);
+  } else if (config.peer.s_addr) {
     addr_in->sin_addr = config.peer;
     addr_in->sin_port = htons(local_port);
   }
+  return strip;
 }
 
 // IW-engine infoResponse (CoD4 retail sub_821FF618) carries the host's
